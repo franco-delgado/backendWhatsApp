@@ -1,4 +1,4 @@
-FROM node:18
+FROM node:20
 
 # Instalar librerías del sistema para Linux
 RUN apt-get update && apt-get install -y \
