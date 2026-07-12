@@ -1,6 +1,6 @@
 FROM node:18
 
-# Instalar librerías del sistema necesarias para entornos Linux/Docker
+# Instalar librerías del sistema para Linux
 RUN apt-get update && apt-get install -y \
     libnss3 \
     libatk-bridge2.0-0 \
@@ -10,15 +10,16 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copiar archivos de dependencias
+# Copiar paquetes de dependencias
 COPY package*.json ./
-RUN npm install --legacy-peer-deps
 
-# Copiar el resto del código del servidor
+# Limpiar caché de npm e instalar de forma directa e independiente
+RUN npm cache clean --force
+RUN npm install --no-audit --no-fund --legacy-peer-deps
+
+# Copiar el resto del código
 COPY . .
 
-# Exponer el puerto que usa Express
 EXPOSE 3000
 
-# Comando para iniciar tu servidor
 CMD ["node", "server.js"]
