@@ -1,6 +1,7 @@
 /**
  * server.js
  * Servidor Node.js que conecta con WhatsApp usando Baileys corregido para Render.
+ * Incluye verificación dinámica de prefijo 9 en Argentina y retraso inteligente anti-spam.
  */
 
 const express = require("express");
@@ -28,6 +29,9 @@ const state = {
 };
 
 let sock; // instancia global del socket de WhatsApp
+
+// FUNCIÓN AUXILIAR PARA GENERAR TIEMPOS DE ESPERA (ENTRE 6 Y 8 SEGUNDOS)
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // FUNCIÓN AUXILIAR PARA BORRAR LA CARPETA DE AUTENTICACIÓN
 function limpiarCarpetaAutenticacion() {
@@ -90,11 +94,9 @@ async function startWhatsApp() {
       );
 
       if (!loggedOut) {
-        // Reintentar conexión automáticamente si se cayó la red
         console.log("[WhatsApp] Reintentando conexión...");
         startWhatsApp();
       } else {
-        // SOLUCIÓN: El usuario cerró sesión en el celular. Limpiamos y re-inicializamos para pedir nuevo QR
         console.log(
           "[WhatsApp] Sesión cerrada. Limpiando datos y generando nuevo QR...",
         );
@@ -160,26 +162,68 @@ app.post("/send", async (req, res) => {
   try {
     let formattedNumber = number.replace(/\D/g, "");
 
-    if (!formattedNumber.startsWith("54")) {
-      if (formattedNumber.startsWith("15")) {
-        formattedNumber = formattedNumber.substring(2);
-      }
-      formattedNumber = "549" + formattedNumber;
-    } else if (
-      formattedNumber.startsWith("54") &&
-      !formattedNumber.startsWith("549")
-    ) {
-      formattedNumber = "549" + formattedNumber.substring(2);
+    // Limpieza inicial: removemos el 15 si el usuario lo ingresó al principio
+    if (formattedNumber.startsWith("15")) {
+      formattedNumber = formattedNumber.substring(2);
     }
 
-    const chatId = formattedNumber + "@s.whatsapp.net";
-    console.log(`[Servidor] Baileys enviando mensaje a: ${chatId}`);
+    // Aseguramos que empiece con el código de Argentina (54)
+    if (!formattedNumber.startsWith("54")) {
+      formattedNumber = "54" + formattedNumber;
+    }
 
-    await sock.sendMessage(chatId, { text: message });
+    // Armamos las dos variantes posibles en la base de datos de WhatsApp
+    let versionCon9 = formattedNumber;
+    let versionSin9 = formattedNumber;
+
+    if (!formattedNumber.startsWith("549")) {
+      versionCon9 = "549" + formattedNumber.substring(2);
+    } else {
+      versionSin9 = "54" + formattedNumber.substring(3);
+    }
+
+    let jidResult = versionCon9 + "@s.whatsapp.net"; // Por defecto apuntamos a la versión con 9
+    console.log(
+      `[Servidor] Buscando formato correcto en WhatsApp para: ${number}`,
+    );
+
+    // Consultamos al servidor de WhatsApp si existe la versión con '549'
+    let [exists] = await sock.onWhatsApp(versionCon9);
+
+    // Si no existe con el 9, le consultamos por el formato viejo sin el 9 ('54')
+    if (!exists || !exists.exists) {
+      console.log(
+        `[Servidor] No se encontró con 549. Probando formato sin 9: ${versionSin9}`,
+      );
+      [exists] = await sock.onWhatsApp(versionSin9);
+    }
+
+    // Si WhatsApp validó cualquiera de los dos formatos, asignamos su JID real
+    if (exists && exists.exists) {
+      jidResult = exists.jid;
+      console.log(`[Servidor] Formato validado por WhatsApp: ${jidResult}`);
+    } else {
+      console.log(
+        `[Servidor] Advertencia: El número no arrojó coincidencias en WhatsApp. Se intentará forzar el envío.`,
+      );
+    }
+
+    // 🔥 RETARDO INTELIGENTE DE 6 A 8 SEGUNDOS
+    // Genera un número aleatorio entre 6000 y 8000 milisegundos
+    const tiempoEspera = Math.floor(Math.random() * (8000 - 6000 + 1)) + 6000;
+    console.log(
+      `[Servidor] Aplicando delay anti-bloqueo de ${(tiempoEspera / 1000).toFixed(1)} segundos...`,
+    );
+    await delay(tiempoEspera);
+
+    // Ejecutamos el envío real del mensaje
+    await sock.sendMessage(jidResult, { text: message });
+    console.log(`[Servidor] Mensaje entregado a Baileys para: ${jidResult}`);
 
     res.json({
       success: true,
       message: "Mensaje enviado con éxito en el servidor.",
+      targetJid: jidResult,
     });
   } catch (err) {
     console.error("[Servidor] Error al enviar el mensaje:", err);
@@ -189,17 +233,12 @@ app.post("/send", async (req, res) => {
   }
 });
 
-/**
- * POST /logout
- * Cierra la sesión, limpia los archivos físicos y vuelve a iniciar Baileys para dar un QR nuevo.
- */
 app.post("/logout", async (req, res) => {
   try {
     state.connectionStatus = "disconnected";
     state.qrDataUrl = null;
 
     if (sock) {
-      // Usamos un try/catch interno por si el socket ya está roto/cerrado externamente
       try {
         await sock.logout();
       } catch (e) {
@@ -207,10 +246,7 @@ app.post("/logout", async (req, res) => {
       }
     }
 
-    // Forzamos la limpieza física de la carpeta
     limpiarCarpetaAutenticacion();
-
-    // REINICIO AUTOMÁTICO EN MEMORIA: Creamos la nueva instancia inmediatamente
     startWhatsApp();
 
     res.json({
