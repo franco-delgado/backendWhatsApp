@@ -1,17 +1,6 @@
 /**
  * server.js
- * Servidor Node.js que conecta con WhatsApp (protocolo WhatsApp Web) usando Baileys,
- * genera un código QR para vincular el número, y expone una API REST simple
- * para que un frontend (React u otro) pueda:
- *   - Ver el estado de conexión
- *   - Obtener el QR como imagen
- *   - Enviar mensajes de WhatsApp
- *
- * Uso:
- *   1) npm install
- *   2) node server.js
- *   3) Abrir http://TU_SERVIDOR:3000/qr en el navegador (o consumirlo desde React)
- *   4) Escanear el QR con WhatsApp > Dispositivos vinculados > Vincular dispositivo
+ * Servidor Node.js que conecta con WhatsApp usando Baileys corregido para Render.
  */
 
 const express = require("express");
@@ -29,16 +18,28 @@ const {
 } = require("@whiskeysockets/baileys");
 
 const PORT = process.env.PORT || 3000;
-const AUTH_FOLDER = path.join(__dirname, "auth_info"); // acá se guarda la sesión (no borrar mientras esté en uso)
+const AUTH_FOLDER = path.join(__dirname, "auth_info");
 
 // Estado en memoria que consulta el frontend
 const state = {
   connectionStatus: "disconnected", // 'disconnected' | 'connecting' | 'qr' | 'connected'
-  qrDataUrl: null, // imagen QR en base64 (data URL), lista para <img src="..." />
+  qrDataUrl: null,
   lastUpdate: Date.now(),
 };
 
 let sock; // instancia global del socket de WhatsApp
+
+// FUNCIÓN AUXILIAR PARA BORRAR LA CARPETA DE AUTENTICACIÓN
+function limpiarCarpetaAutenticacion() {
+  if (fs.existsSync(AUTH_FOLDER)) {
+    try {
+      fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+      console.log("[WhatsApp] Carpeta auth_info eliminada automáticamente.");
+    } catch (err) {
+      console.error("[WhatsApp] Error al eliminar auth_info:", err);
+    }
+  }
+}
 
 async function startWhatsApp() {
   const { state: authState, saveCreds } =
@@ -48,8 +49,8 @@ async function startWhatsApp() {
   sock = makeWASocket({
     version,
     auth: authState,
-    logger: pino({ level: "silent" }), // cambiar a 'info' o 'debug' si necesitás ver logs detallados
-    printQRInTerminal: false, // lo manejamos nosotros para convertirlo en imagen
+    logger: pino({ level: "silent" }),
+    printQRInTerminal: false,
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -58,7 +59,6 @@ async function startWhatsApp() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      // Se generó un nuevo QR: lo convertimos a imagen base64 para servirlo por HTTP
       state.connectionStatus = "qr";
       state.qrDataUrl = await QRCode.toDataURL(qr, { width: 400, margin: 2 });
       state.lastUpdate = Date.now();
@@ -72,7 +72,7 @@ async function startWhatsApp() {
 
     if (connection === "open") {
       state.connectionStatus = "connected";
-      state.qrDataUrl = null; // ya no hace falta el QR
+      state.qrDataUrl = null;
       state.lastUpdate = Date.now();
       console.log("[WhatsApp] Conectado correctamente ✅");
     }
@@ -90,14 +90,16 @@ async function startWhatsApp() {
       );
 
       if (!loggedOut) {
-        // Reintentar conexión automáticamente (ej: se cayó la red)
+        // Reintentar conexión automáticamente si se cayó la red
         console.log("[WhatsApp] Reintentando conexión...");
         startWhatsApp();
       } else {
-        // El usuario desvinculó el dispositivo desde el celular: hay que volver a escanear QR
+        // SOLUCIÓN: El usuario cerró sesión en el celular. Limpiamos y re-inicializamos para pedir nuevo QR
         console.log(
-          "[WhatsApp] Sesión cerrada. Borrá la carpeta auth_info y reiniciá para generar un nuevo QR.",
+          "[WhatsApp] Sesión cerrada. Limpiando datos y generando nuevo QR...",
         );
+        limpiarCarpetaAutenticacion();
+        startWhatsApp();
       }
     }
   });
@@ -108,26 +110,16 @@ async function startWhatsApp() {
 // ---------------------- API REST ----------------------
 
 const app = express();
-app.use(cors()); // permite que tu React (en otro puerto/dominio) consuma esta API
+app.use(cors());
 app.use(express.json());
 
-/**
- * GET /status
- * Devuelve el estado actual de la conexión.
- * El frontend puede hacer polling cada 2-3 segundos a este endpoint.
- */
 app.get("/status", (req, res) => {
   res.json({
-    status: state.connectionStatus, // 'disconnected' | 'connecting' | 'qr' | 'connected'
+    status: state.connectionStatus,
     lastUpdate: state.lastUpdate,
   });
 });
 
-/**
- * GET /qr
- * Devuelve el QR como JSON con la imagen en base64 (data URL),
- * lista para usar directamente en un <img src={qrDataUrl} />.
- */
 app.get("/qr", (req, res) => {
   if (state.connectionStatus === "connected") {
     return res
@@ -142,11 +134,6 @@ app.get("/qr", (req, res) => {
   res.json({ qr: state.qrDataUrl });
 });
 
-/**
- * GET /qr/image
- * Igual que /qr pero devuelve directamente la imagen PNG (útil para probar en el navegador
- * poniendo la URL directa, ej: http://localhost:3000/qr/image).
- */
 app.get("/qr/image", (req, res) => {
   if (!state.qrDataUrl) {
     return res.status(404).send("QR no disponible todavía");
@@ -157,11 +144,6 @@ app.get("/qr/image", (req, res) => {
   res.send(imgBuffer);
 });
 
-/**
- * POST /send
- * Body JSON: { "number": "5491122334455", "message": "Hola desde la API" }
- * El número va sin "+" y sin espacios, con código de país incluido.
- */
 app.post("/send", async (req, res) => {
   let { number, message } = req.body;
 
@@ -169,7 +151,6 @@ app.post("/send", async (req, res) => {
     return res.status(400).json({ success: false, error: "Faltan parámetros" });
   }
 
-  // Verificación de seguridad por si le pegan al endpoint antes de escanear el QR
   if (!sock || state.connectionStatus !== "connected") {
     return res
       .status(400)
@@ -177,10 +158,8 @@ app.post("/send", async (req, res) => {
   }
 
   try {
-    // 1. Limpiamos el número de símbolos
     let formattedNumber = number.replace(/\D/g, "");
 
-    // 2. Formateo para celulares de Argentina (54 + 9 + área + número)
     if (!formattedNumber.startsWith("54")) {
       if (formattedNumber.startsWith("15")) {
         formattedNumber = formattedNumber.substring(2);
@@ -193,12 +172,9 @@ app.post("/send", async (req, res) => {
       formattedNumber = "549" + formattedNumber.substring(2);
     }
 
-    // 3. CORRECCIÓN: Sufijo correcto para la librería Baileys 🚀
     const chatId = formattedNumber + "@s.whatsapp.net";
-
     console.log(`[Servidor] Baileys enviando mensaje a: ${chatId}`);
 
-    // 4. CORRECCIÓN: Usamos 'sock' con la estructura correcta { text: ... }
     await sock.sendMessage(chatId, { text: message });
 
     res.json({
@@ -215,47 +191,42 @@ app.post("/send", async (req, res) => {
 
 /**
  * POST /logout
- * Cierra la sesión actual de WhatsApp (borra credenciales) para poder vincular otro número.
+ * Cierra la sesión, limpia los archivos físicos y vuelve a iniciar Baileys para dar un QR nuevo.
  */
 app.post("/logout", async (req, res) => {
   try {
-    if (sock) {
-      await sock.logout();
-    }
-    if (fs.existsSync(AUTH_FOLDER)) {
-      fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-    }
     state.connectionStatus = "disconnected";
     state.qrDataUrl = null;
+
+    if (sock) {
+      // Usamos un try/catch interno por si el socket ya está roto/cerrado externamente
+      try {
+        await sock.logout();
+      } catch (e) {
+        console.log("[Servidor] El socket ya estaba desconectado.");
+      }
+    }
+
+    // Forzamos la limpieza física de la carpeta
+    limpiarCarpetaAutenticacion();
+
+    // REINICIO AUTOMÁTICO EN MEMORIA: Creamos la nueva instancia inmediatamente
+    startWhatsApp();
+
     res.json({
       success: true,
-      message: "Sesión cerrada. Reiniciá el servidor para generar un nuevo QR.",
+      message: "Sesión desvinculada con éxito. El nuevo QR se está generando.",
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// FUNCIÓN DE LIMPIEZA AUTOMÁTICA AL INICIAR
-if (fs.existsSync(AUTH_FOLDER)) {
-  try {
-    console.log(
-      "[Servidor] Limpiando residuos de sesiones anteriores en auth_info...",
-    );
-    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-    console.log(
-      "[Servidor] Carpeta auth_info vaciada con éxito. Listo para un nuevo QR.",
-    );
-  } catch (err) {
-    console.error("[Servidor] Error al limpiar la carpeta auth_info:", err);
-  }
-}
+// FUNCIÓN DE LIMPIEZA INICIAL AL ARRANCAR EL CONTENEDOR
+limpiarCarpetaAutenticacion();
 
 app.listen(PORT, () => {
   console.log(`[Servidor] API corriendo en http://localhost:${PORT}`);
-  console.log(
-    `[Servidor] Endpoints: GET /status | GET /qr | GET /qr/image | POST /send | POST /logout`,
-  );
 });
 
 startWhatsApp();
