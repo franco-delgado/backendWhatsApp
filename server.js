@@ -1,7 +1,7 @@
 /**
  * server.js
  * Servidor Node.js que conecta con WhatsApp usando Baileys corregido para Render.
- * Incluye verificación dinámica de prefijo 9 en Argentina y retraso inteligente anti-spam.
+ * Incluye verificación dinámica de prefijo 9 en Argentina y retraso inteligente extendido (8 a 68s).
  */
 
 const express = require("express");
@@ -30,7 +30,7 @@ const state = {
 
 let sock; // instancia global del socket de WhatsApp
 
-// FUNCIÓN AUXILIAR PARA GENERAR TIEMPOS DE ESPERA (ENTRE 6 Y 8 SEGUNDOS)
+// FUNCIÓN AUXILIAR PARA GENERAR TIEMPOS DE ESPERA
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // FUNCIÓN AUXILIAR PARA BORRAR LA CARPETA DE AUTENTICACIÓN
@@ -208,11 +208,11 @@ app.post("/send", async (req, res) => {
       );
     }
 
-    // 🔥 RETARDO INTELIGENTE DE 6 A 8 SEGUNDOS
-    // Genera un número aleatorio entre 6000 y 8000 milisegundos
-    const tiempoEspera = Math.floor(Math.random() * (8000 - 6000 + 1)) + 6000;
+    // 🔥 MODIFICACIÓN: RETARDO ALEATORIO DE 8 A 68 SEGUNDOS
+    // Genera un número entero aleatorio entre 8000ms (mínimo) y 68000ms (máximo)
+    const tiempoEspera = Math.floor(Math.random() * (68000 - 8000 + 1)) + 8000;
     console.log(
-      `[Servidor] Aplicando delay anti-bloqueo de ${(tiempoEspera / 1000).toFixed(1)} segundos...`,
+      `[Servidor] Aplicando delay anti-bloqueo masivo de ${(tiempoEspera / 1000).toFixed(1)} segundos...`,
     );
     await delay(tiempoEspera);
 
