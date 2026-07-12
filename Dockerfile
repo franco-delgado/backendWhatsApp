@@ -12,7 +12,7 @@ WORKDIR /app
 
 # Copiar archivos de dependencias
 COPY package*.json ./
-RUN npm install
+RUN npm cl
 
 # Copiar el resto del código del servidor
 COPY . .
