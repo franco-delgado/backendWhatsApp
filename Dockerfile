@@ -12,7 +12,7 @@ WORKDIR /app
 
 # Copiar archivos de dependencias
 COPY package*.json ./
-RUN npm cl
+RUN npm install --legacy-peer-deps
 
 # Copiar el resto del código del servidor
 COPY . .
