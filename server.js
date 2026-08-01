@@ -20,11 +20,8 @@ const PORT = process.env.PORT || 3000;
 // MIDDLEWARES GENERALES Y CORS
 // ==========================================
 
-// Configuración de CORS restringida a los dominios autorizados
 app.use(cors({
-  origin: [
-    'https://whatsapp-multidestinos.onrender.com', // Frontend en Render
-  ],
+  origin: '*', // Permite peticiones desde cualquier origen (o mantén tu dominio de frontend)
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Bypass-Tunnel-Reminder'],
   credentials: true
@@ -32,7 +29,6 @@ app.use(cors({
 
 app.use(express.json());
 
-// Middleware para bypass de la pantalla de advertencia de localtunnel
 app.use((req, res, next) => {
   res.setHeader('Bypass-Tunnel-Reminder', 'true');
   next();
@@ -41,15 +37,11 @@ app.use((req, res, next) => {
 // ==========================================
 // ALMACENAMIENTO EN MEMORIA DE MENSAJES
 // ==========================================
-// Mantiene los mensajes recibidos para ser consultados desde el Frontend
 let mensajesRecibidos = [];
 
-// Helper para pausar ejecuciones en envíos masivos y no saturar la API de Meta
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Función auxiliar para enrutar según el tipo de mensaje solicitado
 async function procesarEnvio(payload) {
-  // Extraemos datos tolerando distintas convenciones de nombres desde el frontend
   const number = payload.number || payload.to || payload.phone;
   const type = payload.type || 'template';
   const parameters = payload.parameters || payload.params || [];
@@ -62,22 +54,17 @@ async function procesarEnvio(payload) {
 
   switch (type) {
     case 'template':
-      // 🔍 LOG DE CONTROL EN CONSOLA
       console.log(`[procesarEnvio] Solicitado template: "${templateName}" para destino: ${number}`);
-      
       return await enviarPlantillaWhatsApp(
         number, 
         parameters, 
-        templateName, // Pasa directamente el nombre extraído del cliente
+        templateName, 
         languageCode
       );
     
     case 'text':
       if (!payload.text) throw new Error("Para mensajes de tipo 'text', el campo 'text' es obligatorio.");
-      
-      // Capturamos la variable contextMessageId si el frontend la manda para citar mensajes
       const contextMessageId = payload.contextMessageId || payload.context_message_id || null;
-      
       return await enviarTextoLibreWhatsApp(number, payload.text, contextMessageId);
     
     case 'image':
@@ -89,7 +76,7 @@ async function procesarEnvio(payload) {
       return await enviarDocumentoWhatsApp(number, payload.mediaUrl, payload.filename || 'archivo.pdf', payload.caption || '');
     
     default:
-      throw new Error(`Tipo de mensaje no soportado: '${type}'. Tipos válidos: template, text, image, document.`);
+      throw new Error(`Tipo de mensaje no soportado: '${type}'.`);
   }
 }
 
@@ -106,7 +93,6 @@ app.get("/status", (req, res) => {
 
 // ENDPOINTS PARA EL FRONTEND (BANDEJA DE ENTRADA)
 
-// Obtener todos los mensajes recibidos
 app.get("/api/mensajes", (req, res) => {
   res.json({
     success: true,
@@ -115,7 +101,6 @@ app.get("/api/mensajes", (req, res) => {
   });
 });
 
-// Vaciar bandeja de entrada
 app.delete("/api/mensajes", (req, res) => {
   mensajesRecibidos = [];
   res.json({
@@ -124,11 +109,9 @@ app.delete("/api/mensajes", (req, res) => {
   });
 });
 
-// Responder a un mensaje desde la interfaz de React
 app.post("/api/mensajes/responder", async (req, res) => {
   try {
     const { to, number, messageText, text, contextMessageId } = req.body;
-
     const destinatario = to || number;
     const mensaje = messageText || text;
 
@@ -162,7 +145,6 @@ app.post("/api/mensajes/responder", async (req, res) => {
 
 // WEBHOOK PARA META (VERIFICACIÓN Y RECEPCIÓN)
 
-// 1. GET /webhook: Para la verificación inicial del Webhook desde el panel de Meta Developers
 app.get("/webhook", (req, res) => {
   const verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
 
@@ -182,59 +164,73 @@ app.get("/webhook", (req, res) => {
   res.sendStatus(400);
 });
 
-// 2. POST /webhook: Para recibir los estados de los mensajes y respuestas de usuarios
 app.post("/webhook", (req, res) => {
-  const body = req.body;
+  try {
+    const body = req.body;
 
-  if (body.object === "whatsapp_business_account") {
-    // Responder a Meta inmediatamente con 200 OK para evitar reintentos duplicados
-    res.status(200).send("EVENT_RECEIVED");
+    if (body.object === "whatsapp_business_account") {
+      // Responder a Meta INMEDIATAMENTE para evitar retries o timeouts (200 OK)
+      res.status(200).send("EVENT_RECEIVED");
 
-    // Procesar evento en segundo plano
-    body.entry?.forEach((entry) => {
-      const changes = entry.changes;
-      changes?.forEach((change) => {
-        const value = change.value;
+      body.entry?.forEach((entry) => {
+        entry.changes?.forEach((change) => {
+          const value = change.value;
 
-        // Caso A: Notificación de estados de entrega (sent, delivered, read, failed)
-        if (value?.statuses) {
-          value.statuses.forEach((status) => {
-            console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status} | Destino: ${status.recipient_id}`);
-            if (status.status === "failed") {
-              console.error("[Status Error Details]:", JSON.stringify(status.errors, null, 2));
-            }
-          });
-        }
+          // A: Status updates
+          if (value?.statuses) {
+            value.statuses.forEach((status) => {
+              console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status}`);
+            });
+          }
 
-        // Caso B: El usuario responde un mensaje
-        if (value?.messages) {
-          value.messages.forEach((msg) => {
-            console.log(`[Mensaje Recibido] De: ${msg.from} | Tipo: ${msg.type}`);
-            
-            // Extraer el nombre del contacto si viene en el payload
-            const contactName = value.contacts?.[0]?.profile?.name || "Desconocido";
+          // B: Mensajes entrantes
+          if (value?.messages) {
+            value.messages.forEach((msg) => {
+              // Buscar el nombre del contacto asociado a este numero específico
+              const contactObj = value.contacts?.find(c => c.wa_id === msg.from);
+              const contactName = contactObj?.profile?.name || "Desconocido";
 
-            const nuevoMensaje = {
-              id: msg.id,
-              from: msg.from,
-              nombre: contactName,
-              type: msg.type,
-              text: msg.type === "text" ? msg.text.body : `[Mensaje de tipo: ${msg.type}]`,
-              timestamp: new Date(parseInt(msg.timestamp) * 1000).toISOString(),
-            };
+              // Extraer contenido de forma segura según el tipo
+              let contenidoTexto = "";
+              if (msg.type === "text" && msg.text?.body) {
+                contenidoTexto = msg.text.body;
+              } else if (msg.type === "button" && msg.button?.text) {
+                contenidoTexto = msg.button.text;
+              } else if (msg.type === "interactive") {
+                contenidoTexto = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || "[Respuesta Interactiva]";
+              } else {
+                contenidoTexto = `[Mensaje de tipo: ${msg.type}]`;
+              }
 
-            if (msg.type === "text") {
-              console.log(`[Texto]: ${msg.text.body}`);
-            }
+              const nuevoMensaje = {
+                id: msg.id,
+                from: msg.from,
+                nombre: contactName,
+                type: msg.type,
+                text: contenidoTexto,
+                timestamp: new Date(parseInt(msg.timestamp) * 1000).toISOString(),
+              };
 
-            // Almacenar el mensaje al inicio del arreglo
-            mensajesRecibidos.unshift(nuevoMensaje);
-          });
-        }
+              console.log(`[Mensaje Recibido] De: ${contactName} (${msg.from}): ${contenidoTexto}`);
+
+              // Evitar duplicados por reintentos de Meta
+              const yaExiste = mensajesRecibidos.some(m => m.id === msg.id);
+              if (!yaExiste) {
+                mensajesRecibidos.unshift(nuevoMensaje);
+              }
+            });
+          }
+        });
       });
-    });
-  } else {
-    res.sendStatus(404);
+    } else {
+      res.sendStatus(404);
+    }
+  } catch (error) {
+    console.error("[Webhook Error]: Fallo al procesar evento:", error);
+    // Si la respuesta no fue enviada aún, mandar 200 de todos modos para que Meta no reintente
+    if (!res.headersSent) {
+      res.status(200).send("EVENT_RECEIVED");
+    }
   }
 });
 
@@ -242,7 +238,6 @@ app.post("/webhook", (req, res) => {
 // ENDPOINTS DE ENVÍO
 // ==========================================
 
-// Endpoint de envío individual (soporta plantillas, texto libre, imágenes, PDFs)
 app.post("/send", async (req, res) => {
   try {
     const result = await procesarEnvio(req.body);
@@ -261,7 +256,6 @@ app.post("/send", async (req, res) => {
   }
 });
 
-// Endpoint de envío masivo con control de pacing (delay)
 app.post("/send-bulk", async (req, res) => {
   const { contacts, delayMs = 200 } = req.body; 
 
@@ -278,7 +272,6 @@ app.post("/send-bulk", async (req, res) => {
     const contact = contacts[i];
 
     try {
-      // Pasa el objeto 'contact' entero para que procesarEnvio extraiga todo limpiamente
       const response = await procesarEnvio(contact);
 
       results.push({
@@ -294,7 +287,6 @@ app.post("/send-bulk", async (req, res) => {
       });
     }
 
-    // Aplicar pausa entre peticiones para respetar Rate Limits
     if (i < contacts.length - 1) {
       await delay(delayMs);
     }
