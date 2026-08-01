@@ -24,8 +24,6 @@ const PORT = process.env.PORT || 3000;
 app.use(cors({
   origin: [
     'https://whatsapp-multidestinos.onrender.com', // Frontend en Render
-    'http://localhost:5173',                        // Frontend local (Vite)
-    'http://localhost:3000'                         // Pruebas locales
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Bypass-Tunnel-Reminder'],
