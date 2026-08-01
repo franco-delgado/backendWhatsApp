@@ -17,9 +17,21 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-// MIDDLEWARES GENERALES Y BYPASS TUNNEL
+// MIDDLEWARES GENERALES Y CORS
 // ==========================================
-app.use(cors());
+
+// Configuración de CORS restringida a los dominios autorizados
+app.use(cors({
+  origin: [
+    'https://whatsapp-multidestinos.onrender.com', // Frontend en Render
+    'http://localhost:5173',                        // Frontend local (Vite)
+    'http://localhost:3000'                         // Pruebas locales
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Bypass-Tunnel-Reminder'],
+  credentials: true
+}));
+
 app.use(express.json());
 
 // Middleware para bypass de la pantalla de advertencia de localtunnel
