@@ -1,268 +1,302 @@
 /**
  * server.js
- * Servidor Node.js que conecta con WhatsApp usando Baileys corregido para Render.
- * Incluye verificación dinámica de prefijo 9 en Argentina y retraso inteligente extendido (8 a 68s).
+ * Servidor Node.js para producción con WhatsApp Business Cloud API (Meta).
  */
+require("dotenv").config();
 
-const express = require("express");
+const express = require('express');
 const cors = require("cors");
-const QRCode = require("qrcode");
-const pino = require("pino");
-const path = require("path");
-const fs = require("fs");
-
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-} = require("@whiskeysockets/baileys");
-
-const PORT = process.env.PORT || 3000;
-const AUTH_FOLDER = path.join(__dirname, "auth_info");
-
-// Estado en memoria que consulta el frontend
-const state = {
-  connectionStatus: "disconnected", // 'disconnected' | 'connecting' | 'qr' | 'connected'
-  qrDataUrl: null,
-  lastUpdate: Date.now(),
-};
-
-let sock; // instancia global del socket de WhatsApp
-
-// FUNCIÓN AUXILIAR PARA GENERAR TIEMPOS DE ESPERA
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// FUNCIÓN AUXILIAR PARA BORRAR LA CARPETA DE AUTENTICACIÓN
-function limpiarCarpetaAutenticacion() {
-  if (fs.existsSync(AUTH_FOLDER)) {
-    try {
-      fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-      console.log("[WhatsApp] Carpeta auth_info eliminada automáticamente.");
-    } catch (err) {
-      console.error("[WhatsApp] Error al eliminar auth_info:", err);
-    }
-  }
-}
-
-async function startWhatsApp() {
-  const { state: authState, saveCreds } =
-    await useMultiFileAuthState(AUTH_FOLDER);
-  const { version } = await fetchLatestBaileysVersion();
-
-  sock = makeWASocket({
-    version,
-    auth: authState,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      state.connectionStatus = "qr";
-      state.qrDataUrl = await QRCode.toDataURL(qr, { width: 400, margin: 2 });
-      state.lastUpdate = Date.now();
-      console.log("[WhatsApp] Nuevo QR generado. Escaneá desde /qr");
-    }
-
-    if (connection === "connecting") {
-      state.connectionStatus = "connecting";
-      state.lastUpdate = Date.now();
-    }
-
-    if (connection === "open") {
-      state.connectionStatus = "connected";
-      state.qrDataUrl = null;
-      state.lastUpdate = Date.now();
-      console.log("[WhatsApp] Conectado correctamente ✅");
-    }
-
-    if (connection === "close") {
-      state.connectionStatus = "disconnected";
-      state.lastUpdate = Date.now();
-
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-
-      console.log(
-        "[WhatsApp] Conexión cerrada. ¿Cerró sesión el usuario?",
-        loggedOut,
-      );
-
-      if (!loggedOut) {
-        console.log("[WhatsApp] Reintentando conexión...");
-        startWhatsApp();
-      } else {
-        console.log(
-          "[WhatsApp] Sesión cerrada. Limpiando datos y generando nuevo QR...",
-        );
-        limpiarCarpetaAutenticacion();
-        startWhatsApp();
-      }
-    }
-  });
-
-  return sock;
-}
-
-// ---------------------- API REST ----------------------
+const { 
+  enviarPlantillaWhatsApp, 
+  enviarTextoLibreWhatsApp, 
+  enviarImagenWhatsApp, 
+  enviarDocumentoWhatsApp 
+} = require("./whatsappService");
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+// ==========================================
+// MIDDLEWARES GENERALES Y BYPASS TUNNEL
+// ==========================================
 app.use(cors());
 app.use(express.json());
 
+// Middleware para bypass de la pantalla de advertencia de localtunnel
+app.use((req, res, next) => {
+  res.setHeader('Bypass-Tunnel-Reminder', 'true');
+  next();
+});
+
+// ==========================================
+// ALMACENAMIENTO EN MEMORIA DE MENSAJES
+// ==========================================
+// Mantiene los mensajes recibidos para ser consultados desde el Frontend
+let mensajesRecibidos = [];
+
+// Helper para pausar ejecuciones en envíos masivos y no saturar la API de Meta
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Función auxiliar para enrutar según el tipo de mensaje solicitado
+async function procesarEnvio(payload) {
+  // Extraemos datos tolerando distintas convenciones de nombres desde el frontend
+  const number = payload.number || payload.to || payload.phone;
+  const type = payload.type || 'template';
+  const parameters = payload.parameters || payload.params || [];
+  const templateName = payload.templateName || payload.template_name || payload.template;
+  const languageCode = payload.languageCode || payload.language_code || 'es_AR';
+
+  if (!number) {
+    throw new Error("El parámetro 'number' (o 'to') es obligatorio.");
+  }
+
+  switch (type) {
+    case 'template':
+      // 🔍 LOG DE CONTROL EN CONSOLA
+      console.log(`[procesarEnvio] Solicitado template: "${templateName}" para destino: ${number}`);
+      
+      return await enviarPlantillaWhatsApp(
+        number, 
+        parameters, 
+        templateName, // Pasa directamente el nombre extraído del cliente
+        languageCode
+      );
+    
+    case 'text':
+      if (!payload.text) throw new Error("Para mensajes de tipo 'text', el campo 'text' es obligatorio.");
+      
+      // Capturamos la variable contextMessageId si el frontend la manda para citar mensajes
+      const contextMessageId = payload.contextMessageId || payload.context_message_id || null;
+      
+      return await enviarTextoLibreWhatsApp(number, payload.text, contextMessageId);
+    
+    case 'image':
+      if (!payload.mediaUrl) throw new Error("Para tipo 'image', el campo 'mediaUrl' es obligatorio.");
+      return await enviarImagenWhatsApp(number, payload.mediaUrl, payload.caption || '');
+    
+    case 'document':
+      if (!payload.mediaUrl) throw new Error("Para tipo 'document', el campo 'mediaUrl' es obligatorio.");
+      return await enviarDocumentoWhatsApp(number, payload.mediaUrl, payload.filename || 'archivo.pdf', payload.caption || '');
+    
+    default:
+      throw new Error(`Tipo de mensaje no soportado: '${type}'. Tipos válidos: template, text, image, document.`);
+  }
+}
+
+// ENDPOINTS DE UTILIDAD Y SALUD
+
 app.get("/status", (req, res) => {
   res.json({
-    status: state.connectionStatus,
-    lastUpdate: state.lastUpdate,
+    status: "connected",
+    environment: process.env.NODE_ENV || "production",
+    provider: "Meta WhatsApp Cloud API",
+    timestamp: new Date().toISOString(),
   });
 });
 
-app.get("/qr", (req, res) => {
-  if (state.connectionStatus === "connected") {
-    return res
-      .status(200)
-      .json({ message: "Ya está conectado, no hace falta escanear QR." });
-  }
-  if (!state.qrDataUrl) {
-    return res.status(202).json({
-      message: "QR aún no generado, esperá unos segundos y reintentá.",
+// ENDPOINTS PARA EL FRONTEND (BANDEJA DE ENTRADA)
+
+// Obtener todos los mensajes recibidos
+app.get("/api/mensajes", (req, res) => {
+  res.json({
+    success: true,
+    total: mensajesRecibidos.length,
+    data: mensajesRecibidos,
+  });
+});
+
+// Vaciar bandeja de entrada
+app.delete("/api/mensajes", (req, res) => {
+  mensajesRecibidos = [];
+  res.json({
+    success: true,
+    message: "Historial de mensajes limpiado.",
+  });
+});
+
+// Responder a un mensaje desde la interfaz de React
+app.post("/api/mensajes/responder", async (req, res) => {
+  try {
+    const { to, number, messageText, text, contextMessageId } = req.body;
+
+    const destinatario = to || number;
+    const mensaje = messageText || text;
+
+    if (!destinatario || !mensaje) {
+      return res.status(400).json({
+        success: false,
+        error: "Los campos 'to' (o 'number') y 'messageText' (o 'text') son obligatorios.",
+      });
+    }
+
+    const result = await procesarEnvio({
+      to: destinatario,
+      type: 'text',
+      text: mensaje,
+      contextMessageId: contextMessageId || null
+    });
+
+    res.json({
+      success: true,
+      message: "Respuesta enviada con éxito.",
+      data: result,
+    });
+  } catch (err) {
+    console.error("[Servidor] Error en /api/mensajes/responder:", err.message);
+    res.status(400).json({
+      success: false,
+      error: err.message,
     });
   }
-  res.json({ qr: state.qrDataUrl });
 });
 
-app.get("/qr/image", (req, res) => {
-  if (!state.qrDataUrl) {
-    return res.status(404).send("QR no disponible todavía");
+// WEBHOOK PARA META (VERIFICACIÓN Y RECEPCIÓN)
+
+// 1. GET /webhook: Para la verificación inicial del Webhook desde el panel de Meta Developers
+app.get("/webhook", (req, res) => {
+  const verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
+
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode && token) {
+    if (mode === "subscribe" && token === verifyToken) {
+      console.log("[Webhook] Verificado con éxito por Meta.");
+      return res.status(200).send(challenge);
+    } else {
+      console.warn("[Webhook] Falló la verificación. Token incorrecto.");
+      return res.sendStatus(403);
+    }
   }
-  const base64Data = state.qrDataUrl.replace(/^data:image\/png;base64,/, "");
-  const imgBuffer = Buffer.from(base64Data, "base64");
-  res.setHeader("Content-Type", "image/png");
-  res.send(imgBuffer);
+  res.sendStatus(400);
 });
 
+// 2. POST /webhook: Para recibir los estados de los mensajes y respuestas de usuarios
+app.post("/webhook", (req, res) => {
+  const body = req.body;
+
+  if (body.object === "whatsapp_business_account") {
+    // Responder a Meta inmediatamente con 200 OK para evitar reintentos duplicados
+    res.status(200).send("EVENT_RECEIVED");
+
+    // Procesar evento en segundo plano
+    body.entry?.forEach((entry) => {
+      const changes = entry.changes;
+      changes?.forEach((change) => {
+        const value = change.value;
+
+        // Caso A: Notificación de estados de entrega (sent, delivered, read, failed)
+        if (value?.statuses) {
+          value.statuses.forEach((status) => {
+            console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status} | Destino: ${status.recipient_id}`);
+            if (status.status === "failed") {
+              console.error("[Status Error Details]:", JSON.stringify(status.errors, null, 2));
+            }
+          });
+        }
+
+        // Caso B: El usuario responde un mensaje
+        if (value?.messages) {
+          value.messages.forEach((msg) => {
+            console.log(`[Mensaje Recibido] De: ${msg.from} | Tipo: ${msg.type}`);
+            
+            // Extraer el nombre del contacto si viene en el payload
+            const contactName = value.contacts?.[0]?.profile?.name || "Desconocido";
+
+            const nuevoMensaje = {
+              id: msg.id,
+              from: msg.from,
+              nombre: contactName,
+              type: msg.type,
+              text: msg.type === "text" ? msg.text.body : `[Mensaje de tipo: ${msg.type}]`,
+              timestamp: new Date(parseInt(msg.timestamp) * 1000).toISOString(),
+            };
+
+            if (msg.type === "text") {
+              console.log(`[Texto]: ${msg.text.body}`);
+            }
+
+            // Almacenar el mensaje al inicio del arreglo
+            mensajesRecibidos.unshift(nuevoMensaje);
+          });
+        }
+      });
+    });
+  } else {
+    res.sendStatus(404);
+  }
+});
+
+// ==========================================
+// ENDPOINTS DE ENVÍO
+// ==========================================
+
+// Endpoint de envío individual (soporta plantillas, texto libre, imágenes, PDFs)
 app.post("/send", async (req, res) => {
-  let { number, message } = req.body;
-
-  if (!number || !message) {
-    return res.status(400).json({ success: false, error: "Faltan parámetros" });
-  }
-
-  if (!sock || state.connectionStatus !== "connected") {
-    return res
-      .status(400)
-      .json({ success: false, error: "WhatsApp no está conectado." });
-  }
-
   try {
-    let formattedNumber = number.replace(/\D/g, "");
-
-    // Limpieza inicial: removemos el 15 si el usuario lo ingresó al principio
-    if (formattedNumber.startsWith("15")) {
-      formattedNumber = formattedNumber.substring(2);
-    }
-
-    // Aseguramos que empiece con el código de Argentina (54)
-    if (!formattedNumber.startsWith("54")) {
-      formattedNumber = "54" + formattedNumber;
-    }
-
-    // Armamos las dos variantes posibles en la base de datos de WhatsApp
-    let versionCon9 = formattedNumber;
-    let versionSin9 = formattedNumber;
-
-    if (!formattedNumber.startsWith("549")) {
-      versionCon9 = "549" + formattedNumber.substring(2);
-    } else {
-      versionSin9 = "54" + formattedNumber.substring(3);
-    }
-
-    let jidResult = versionCon9 + "@s.whatsapp.net"; // Por defecto apuntamos a la versión con 9
-    console.log(
-      `[Servidor] Buscando formato correcto en WhatsApp para: ${number}`,
-    );
-
-    // Consultamos al servidor de WhatsApp si existe la versión con '549'
-    let [exists] = await sock.onWhatsApp(versionCon9);
-
-    // Si no existe con el 9, le consultamos por el formato viejo sin el 9 ('54')
-    if (!exists || !exists.exists) {
-      console.log(
-        `[Servidor] No se encontró con 549. Probando formato sin 9: ${versionSin9}`,
-      );
-      [exists] = await sock.onWhatsApp(versionSin9);
-    }
-
-    // Si WhatsApp validó cualquiera de los dos formatos, asignamos su JID real
-    if (exists && exists.exists) {
-      jidResult = exists.jid;
-      console.log(`[Servidor] Formato validado por WhatsApp: ${jidResult}`);
-    } else {
-      console.log(
-        `[Servidor] Advertencia: El número no arrojó coincidencias en WhatsApp. Se intentará forzar el envío.`,
-      );
-    }
-
-    // 🔥 MODIFICACIÓN: RETARDO ALEATORIO DE 8 A 68 SEGUNDOS
-    // Genera un número entero aleatorio entre 8000ms (mínimo) y 68000ms (máximo)
-    const tiempoEspera = Math.floor(Math.random() * (68000 - 8000 + 1)) + 8000;
-    console.log(
-      `[Servidor] Aplicando delay anti-bloqueo masivo de ${(tiempoEspera / 1000).toFixed(1)} segundos...`,
-    );
-    await delay(tiempoEspera);
-
-    // Ejecutamos el envío real del mensaje
-    await sock.sendMessage(jidResult, { text: message });
-    console.log(`[Servidor] Mensaje entregado a Baileys para: ${jidResult}`);
+    const result = await procesarEnvio(req.body);
 
     res.json({
       success: true,
-      message: "Mensaje enviado con éxito en el servidor.",
-      targetJid: jidResult,
+      message: "Mensaje procesado con éxito.",
+      data: result,
     });
   } catch (err) {
-    console.error("[Servidor] Error al enviar el mensaje:", err);
-    res
-      .status(500)
-      .json({ success: false, error: "No se pudo entregar el mensaje." });
+    console.error("[Servidor] Error en /send:", err.message);
+    res.status(400).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
 
-app.post("/logout", async (req, res) => {
-  try {
-    state.connectionStatus = "disconnected";
-    state.qrDataUrl = null;
+// Endpoint de envío masivo con control de pacing (delay)
+app.post("/send-bulk", async (req, res) => {
+  const { contacts, delayMs = 200 } = req.body; 
 
-    if (sock) {
-      try {
-        await sock.logout();
-      } catch (e) {
-        console.log("[Servidor] El socket ya estaba desconectado.");
-      }
+  if (!Array.isArray(contacts) || contacts.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: "Se requiere un arreglo 'contacts' válido y no vacío.",
+    });
+  }
+
+  const results = [];
+
+  for (let i = 0; i < contacts.length; i++) {
+    const contact = contacts[i];
+
+    try {
+      // Pasa el objeto 'contact' entero para que procesarEnvio extraiga todo limpiamente
+      const response = await procesarEnvio(contact);
+
+      results.push({
+        number: contact.number || contact.to,
+        status: "success",
+        response,
+      });
+    } catch (err) {
+      results.push({
+        number: contact.number || contact.to,
+        status: "error",
+        error: err.message,
+      });
     }
 
-    limpiarCarpetaAutenticacion();
-    startWhatsApp();
-
-    res.json({
-      success: true,
-      message: "Sesión desvinculada con éxito. El nuevo QR se está generando.",
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    // Aplicar pausa entre peticiones para respetar Rate Limits
+    if (i < contacts.length - 1) {
+      await delay(delayMs);
+    }
   }
-});
 
-// FUNCIÓN DE LIMPIEZA INICIAL AL ARRANCAR EL CONTENEDOR
-limpiarCarpetaAutenticacion();
+  res.json({
+    success: true,
+    processed: results.length,
+    results,
+  });
+});
 
 app.listen(PORT, () => {
-  console.log(`[Servidor] API corriendo en http://localhost:${PORT}`);
+  console.log(`[Servidor Producción] API corriendo en puerto ${PORT}`);
 });
-
-startWhatsApp();

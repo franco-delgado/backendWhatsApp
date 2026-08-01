@@ -9,7 +9,9 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
+    "axios": "^1.18.1",
     "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
     "express": "^4.21.2",
     "pino": "^9.5.0",
     "qrcode": "^1.5.4"
