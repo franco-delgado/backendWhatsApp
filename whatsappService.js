@@ -168,9 +168,58 @@ async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'docum
   });
 }
 
+/**
+ * 5. Obtención / Descarga de MULTIMEDIA (Audios, imágenes, documentos recibidos)
+ */
+async function obtenerMediaWhatsApp(mediaId) {
+  const token = process.env.META_ACCESS_TOKEN;
+
+  if (!token) {
+    throw new Error('Falta el token META_ACCESS_TOKEN en las variables de entorno.');
+  }
+
+  try {
+    // Paso 1: Consultar la API de Meta para obtener la URL binaria temporal del archivo
+    const metaMediaResponse = await axios.get(`https://graph.facebook.com/v22.0/${mediaId}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`
+      }
+    });
+
+    const downloadUrl = metaMediaResponse.data?.url;
+    const mimeType = metaMediaResponse.data?.mime_type;
+
+    if (!downloadUrl) {
+      throw new Error('No se pudo obtener la URL de descarga del archivo desde Meta.');
+    }
+
+    // Paso 2: Descargar el archivo binario enviando el Bearer Token en los headers
+    const fileResponse = await axios.get(downloadUrl, {
+      headers: {
+        'Authorization': `Bearer ${token}`
+      },
+      responseType: 'arraybuffer'
+    });
+
+    return {
+      buffer: Buffer.from(fileResponse.data),
+      mimeType: mimeType || 'audio/ogg'
+    };
+  } catch (error) {
+    if (error.response) {
+      const metaError = error.response.data?.error;
+      console.error('❌ Error al obtener media de Meta:', JSON.stringify(metaError || error.response.data, null, 2));
+      throw new Error(`Error descargando media (${error.response.status}): ${metaError?.message || 'Error de la API de Meta'}`);
+    }
+    console.error('❌ Error de red descargando media:', error.message);
+    throw error;
+  }
+}
+
 module.exports = {
   enviarPlantillaWhatsApp,
   enviarTextoLibreWhatsApp,
   enviarImagenWhatsApp,
-  enviarDocumentoWhatsApp
+  enviarDocumentoWhatsApp,
+  obtenerMediaWhatsApp
 };
