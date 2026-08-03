@@ -23,11 +23,7 @@ const PORT = process.env.PORT || 3000;
 // ==========================================
 
 app.use(cors({
-  origin: [
-    'https://whatsapp-multidestinos.onrender.com', // Frontend en Render
-    'http://localhost:5173',                        // Frontend local (Vite)
-    'http://localhost:3000'                         // Pruebas locales
-  ],
+  origin: '*', // Permite peticiones desde cualquier origen (o mantén tu dominio de frontend)
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Bypass-Tunnel-Reminder'],
   credentials: true
@@ -81,7 +77,7 @@ async function procesarEnvio(payload) {
       return await enviarDocumentoWhatsApp(number, payload.mediaUrl, payload.filename || 'archivo.pdf', payload.caption || '');
     
     default:
-      throw new Error(`Tipo de mensaje no soportado: '${type}'. Tipos válidos: template, text, image, document.`);
+      throw new Error(`Tipo de mensaje no soportado: '${type}'.`);
   }
 }
 
@@ -168,74 +164,90 @@ app.get("/webhook", (req, res) => {
   res.sendStatus(400);
 });
 
-// 2. POST /webhook: Para recibir los estados de los mensajes y respuestas de usuarios
+// POST /webhook: Para recibir los estados de los mensajes y respuestas de usuarios
 app.post("/webhook", async (req, res) => {
-  const body = req.body;
+  try {
+    const body = req.body;
 
-  if (body.object === "whatsapp_business_account") {
-    // Responder a Meta inmediatamente con 200 OK para evitar reintentos duplicados
-    res.status(200).send("EVENT_RECEIVED");
+    if (body.object === "whatsapp_business_account") {
+      // Responder a Meta INMEDIATAMENTE para evitar retries o timeouts (200 OK)
+      res.status(200).send("EVENT_RECEIVED");
 
-    if (body.entry) {
-      for (const entry of body.entry) {
-        if (!entry.changes) continue;
-        for (const change of entry.changes) {
-          const value = change.value;
+      if (body.entry) {
+        for (const entry of body.entry) {
+          if (!entry.changes) continue;
+          for (const change of entry.changes) {
+            const value = change.value;
 
-          // Caso A: Notificación de estados de entrega (sent, delivered, read, failed)
-          if (value?.statuses) {
-            value.statuses.forEach((status) => {
-              console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status} | Destino: ${status.recipient_id}`);
-              if (status.status === "failed") {
-                console.error("[Status Error Details]:", JSON.stringify(status.errors, null, 2));
-              }
-            });
-          }
-
-          // Caso B: El usuario responde un mensaje
-          if (value?.messages) {
-            for (const msg of value.messages) {
-              console.log(`[Mensaje Recibido] De: ${msg.from} | Tipo: ${msg.type}`);
-              
-              const contactName = value.contacts?.[0]?.profile?.name || "Desconocido";
-              let contenido = "";
-
-              // Procesar según el tipo de mensaje recibido
-              if (msg.type === "text") {
-                contenido = msg.text.body;
-              } else if (msg.type === "image" && msg.image?.id) {
-                try {
-                  contenido = await descargarMediaWhatsApp(msg.image.id);
-                } catch (err) {
-                  contenido = "[Error al descargar imagen]";
+            // Caso A: Notificación de estados de entrega (sent, delivered, read, failed)
+            if (value?.statuses) {
+              value.statuses.forEach((status) => {
+                console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status} | Destino: ${status.recipient_id}`);
+                if (status.status === "failed") {
+                  console.error("[Status Error Details]:", JSON.stringify(status.errors, null, 2));
                 }
-              } else if (msg.type === "audio" && msg.audio?.id) {
-                try {
-                  contenido = await descargarMediaWhatsApp(msg.audio.id);
-                } catch (err) {
-                  contenido = "[Error al descargar audio]";
+              });
+            }
+
+            // Caso B: El usuario envía un mensaje
+            if (value?.messages) {
+              for (const msg of value.messages) {
+                console.log(`[Mensaje Recibido] De: ${msg.from} | Tipo: ${msg.type}`);
+                
+                const contactObj = value.contacts?.find(c => c.wa_id === msg.from);
+                const contactName = contactObj?.profile?.name || "Desconocido";
+                let contenido = "";
+
+                // Procesar según el tipo de mensaje recibido
+                if (msg.type === "text" && msg.text?.body) {
+                  contenido = msg.text.body;
+                } else if (msg.type === "button" && msg.button?.text) {
+                  contenido = msg.button.text;
+                } else if (msg.type === "interactive") {
+                  contenido = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || "[Respuesta Interactiva]";
+                } else if (msg.type === "image" && msg.image?.id) {
+                  try {
+                    contenido = await descargarMediaWhatsApp(msg.image.id);
+                  } catch (err) {
+                    contenido = "[Error al descargar imagen]";
+                  }
+                } else if (msg.type === "audio" && msg.audio?.id) {
+                  try {
+                    contenido = await descargarMediaWhatsApp(msg.audio.id);
+                  } catch (err) {
+                    contenido = "[Error al descargar audio]";
+                  }
+                } else {
+                  contenido = `[Mensaje de tipo: ${msg.type}]`;
                 }
-              } else {
-                contenido = `[Mensaje de tipo: ${msg.type}]`;
+
+                const nuevoMensaje = {
+                  id: msg.id,
+                  from: msg.from,
+                  nombre: contactName,
+                  type: msg.type,
+                  text: contenido, // Contiene texto o la URL pública local (/uploads/xxx.ext)
+                  timestamp: new Date(parseInt(msg.timestamp) * 1000).toISOString(),
+                };
+
+                // Evitar duplicados por reintentos de Meta
+                const yaExiste = mensajesRecibidos.some(m => m.id === msg.id);
+                if (!yaExiste) {
+                  mensajesRecibidos.unshift(nuevoMensaje);
+                }
               }
-
-              const nuevoMensaje = {
-                id: msg.id,
-                from: msg.from,
-                nombre: contactName,
-                type: msg.type,
-                text: contenido, // Si es media, contiene la URL pública local (/uploads/xxx.ext)
-                timestamp: new Date(parseInt(msg.timestamp) * 1000).toISOString(),
-              };
-
-              mensajesRecibidos.unshift(nuevoMensaje);
             }
           }
         }
       }
+    } else {
+      res.sendStatus(404);
     }
-  } else {
-    res.sendStatus(404);
+  } catch (error) {
+    console.error("[Webhook Error]: Fallo al procesar evento:", error);
+    if (!res.headersSent) {
+      res.status(200).send("EVENT_RECEIVED");
+    }
   }
 });
 
