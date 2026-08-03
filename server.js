@@ -6,11 +6,13 @@ require("dotenv").config();
 
 const express = require('express');
 const cors = require("cors");
+const path = require("path");
 const { 
   enviarPlantillaWhatsApp, 
   enviarTextoLibreWhatsApp, 
   enviarImagenWhatsApp, 
-  enviarDocumentoWhatsApp 
+  enviarDocumentoWhatsApp,
+  descargarMediaWhatsApp 
 } = require("./whatsappService");
 
 const app = express();
@@ -29,6 +31,10 @@ app.use(cors({
 
 app.use(express.json());
 
+// Servir archivos descargados (Imágenes / Audios) de forma pública
+app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
+
+// Middleware para bypass de la pantalla de advertencia de localtunnel
 app.use((req, res, next) => {
   res.setHeader('Bypass-Tunnel-Reminder', 'true');
   next();
@@ -55,12 +61,7 @@ async function procesarEnvio(payload) {
   switch (type) {
     case 'template':
       console.log(`[procesarEnvio] Solicitado template: "${templateName}" para destino: ${number}`);
-      return await enviarPlantillaWhatsApp(
-        number, 
-        parameters, 
-        templateName, 
-        languageCode
-      );
+      return await enviarPlantillaWhatsApp(number, parameters, templateName, languageCode);
     
     case 'text':
       if (!payload.text) throw new Error("Para mensajes de tipo 'text', el campo 'text' es obligatorio.");
@@ -147,7 +148,6 @@ app.post("/api/mensajes/responder", async (req, res) => {
 
 app.get("/webhook", (req, res) => {
   const verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
-
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
@@ -164,7 +164,8 @@ app.get("/webhook", (req, res) => {
   res.sendStatus(400);
 });
 
-app.post("/webhook", (req, res) => {
+// POST /webhook: Para recibir los estados de los mensajes y respuestas de usuarios
+app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
 
@@ -172,71 +173,85 @@ app.post("/webhook", (req, res) => {
       // Responder a Meta INMEDIATAMENTE para evitar retries o timeouts (200 OK)
       res.status(200).send("EVENT_RECEIVED");
 
-      body.entry?.forEach((entry) => {
-        entry.changes?.forEach((change) => {
-          const value = change.value;
+      if (body.entry) {
+        for (const entry of body.entry) {
+          if (!entry.changes) continue;
+          for (const change of entry.changes) {
+            const value = change.value;
 
-          // A: Status updates
-          if (value?.statuses) {
-            value.statuses.forEach((status) => {
-              console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status}`);
-            });
-          }
+            // Caso A: Notificación de estados de entrega (sent, delivered, read, failed)
+            if (value?.statuses) {
+              value.statuses.forEach((status) => {
+                console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status} | Destino: ${status.recipient_id}`);
+                if (status.status === "failed") {
+                  console.error("[Status Error Details]:", JSON.stringify(status.errors, null, 2));
+                }
+              });
+            }
 
-          // B: Mensajes entrantes
-          if (value?.messages) {
-            value.messages.forEach((msg) => {
-              // Buscar el nombre del contacto asociado a este numero específico
-              const contactObj = value.contacts?.find(c => c.wa_id === msg.from);
-              const contactName = contactObj?.profile?.name || "Desconocido";
+            // Caso B: El usuario envía un mensaje
+            if (value?.messages) {
+              for (const msg of value.messages) {
+                console.log(`[Mensaje Recibido] De: ${msg.from} | Tipo: ${msg.type}`);
+                
+                const contactObj = value.contacts?.find(c => c.wa_id === msg.from);
+                const contactName = contactObj?.profile?.name || "Desconocido";
+                let contenido = "";
 
-              // Extraer contenido de forma segura según el tipo
-              let contenidoTexto = "";
-              if (msg.type === "text" && msg.text?.body) {
-                contenidoTexto = msg.text.body;
-              } else if (msg.type === "button" && msg.button?.text) {
-                contenidoTexto = msg.button.text;
-              } else if (msg.type === "interactive") {
-                contenidoTexto = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || "[Respuesta Interactiva]";
-              } else {
-                contenidoTexto = `[Mensaje de tipo: ${msg.type}]`;
+                // Procesar según el tipo de mensaje recibido
+                if (msg.type === "text" && msg.text?.body) {
+                  contenido = msg.text.body;
+                } else if (msg.type === "button" && msg.button?.text) {
+                  contenido = msg.button.text;
+                } else if (msg.type === "interactive") {
+                  contenido = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || "[Respuesta Interactiva]";
+                } else if (msg.type === "image" && msg.image?.id) {
+                  try {
+                    contenido = await descargarMediaWhatsApp(msg.image.id);
+                  } catch (err) {
+                    contenido = "[Error al descargar imagen]";
+                  }
+                } else if (msg.type === "audio" && msg.audio?.id) {
+                  try {
+                    contenido = await descargarMediaWhatsApp(msg.audio.id);
+                  } catch (err) {
+                    contenido = "[Error al descargar audio]";
+                  }
+                } else {
+                  contenido = `[Mensaje de tipo: ${msg.type}]`;
+                }
+
+                const nuevoMensaje = {
+                  id: msg.id,
+                  from: msg.from,
+                  nombre: contactName,
+                  type: msg.type,
+                  text: contenido, // Contiene texto o la URL pública local (/uploads/xxx.ext)
+                  timestamp: new Date(parseInt(msg.timestamp) * 1000).toISOString(),
+                };
+
+                // Evitar duplicados por reintentos de Meta
+                const yaExiste = mensajesRecibidos.some(m => m.id === msg.id);
+                if (!yaExiste) {
+                  mensajesRecibidos.unshift(nuevoMensaje);
+                }
               }
-
-              const nuevoMensaje = {
-                id: msg.id,
-                from: msg.from,
-                nombre: contactName,
-                type: msg.type,
-                text: contenidoTexto,
-                timestamp: new Date(parseInt(msg.timestamp) * 1000).toISOString(),
-              };
-
-              console.log(`[Mensaje Recibido] De: ${contactName} (${msg.from}): ${contenidoTexto}`);
-
-              // Evitar duplicados por reintentos de Meta
-              const yaExiste = mensajesRecibidos.some(m => m.id === msg.id);
-              if (!yaExiste) {
-                mensajesRecibidos.unshift(nuevoMensaje);
-              }
-            });
+            }
           }
-        });
-      });
+        }
+      }
     } else {
       res.sendStatus(404);
     }
   } catch (error) {
     console.error("[Webhook Error]: Fallo al procesar evento:", error);
-    // Si la respuesta no fue enviada aún, mandar 200 de todos modos para que Meta no reintente
     if (!res.headersSent) {
       res.status(200).send("EVENT_RECEIVED");
     }
   }
 });
 
-// ==========================================
 // ENDPOINTS DE ENVÍO
-// ==========================================
 
 app.post("/send", async (req, res) => {
   try {
