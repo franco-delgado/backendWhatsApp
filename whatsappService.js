@@ -1,4 +1,6 @@
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 /**
  * Función interna genérica para realizar las peticiones a la API de WhatsApp Cloud.
@@ -45,7 +47,7 @@ function _limpiarNumero(numero) {
 }
 
 // ==========================================
-// MÉTODOS PÚBLICOS
+// MÉTODOS PÚBLICOS DE ENVÍO
 // ==========================================
 
 /**
@@ -54,13 +56,8 @@ function _limpiarNumero(numero) {
 async function enviarPlantillaWhatsApp(numeroDestino, parametros = [], templateName, languageCode = 'es_AR') {
   const cleanNumber = _limpiarNumero(numeroDestino);
 
-  // 🔍 LOG 1: Verificar el valor que llegó como argumento en templateName
   console.log('📥 [enviarPlantillaWhatsApp] Parámetro templateName recibido:', templateName);
-
-  // Garantizamos un nombre de plantilla válido
   const nombrePlantilla = templateName;
-
-  // 🔍 LOG 2: Verificar la plantilla resuelta antes de armar el payload
   console.log('📌 [enviarPlantillaWhatsApp] Nombre de plantilla que se procesará:', nombrePlantilla);
 
   const templatePayload = {
@@ -69,7 +66,6 @@ async function enviarPlantillaWhatsApp(numeroDestino, parametros = [], templateN
   };
 
   if (Array.isArray(parametros) && parametros.length > 0) {
-    // 🔴 CASO A: Plantilla 'invitacion' (Header + Body)
     if (nombrePlantilla === 'invitacion' && parametros.length >= 2) {
       console.log('⚙️ [enviarPlantillaWhatsApp] Aplicando estructura de componentes: CASO A (invitacion: Header + Body)');
       const [headerText, ...bodyTexts] = parametros;
@@ -86,9 +82,7 @@ async function enviarPlantillaWhatsApp(numeroDestino, parametros = [], templateN
           parameters: bodyTexts.map(texto => ({ type: 'text', text: String(texto) }))
         }
       ];
-    } 
-    // 🟢 CASO B: Plantillas estándar solo de Body (ej. 'mensaje_mensual')
-    else {
+    } else {
       console.log('⚙️ [enviarPlantillaWhatsApp] Aplicando estructura de componentes: CASO B (Estándar: Solo Body)');
       templatePayload.components = [
         {
@@ -121,7 +115,6 @@ async function enviarTextoLibreWhatsApp(numeroDestino, texto, contextMessageId =
     text: { preview_url: true, body: texto }
   };
 
-  // Si se pasa el ID del mensaje original, se agrega la referencia context
   if (contextMessageId) {
     payload.context = {
       message_id: contextMessageId
@@ -168,9 +161,68 @@ async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'docum
   });
 }
 
+// ==========================================
+// MÉTODOS PÚBLICOS DE RECEPCIÓN / DESCARGA
+// ==========================================
+
+/**
+ * 5. Descarga de archivos multimedia recibidos (Imágenes / Audios)
+ */
+async function descargarMediaWhatsApp(mediaId) {
+  const token = process.env.META_ACCESS_TOKEN;
+
+  if (!token) {
+    throw new Error('Falta la credencial META_ACCESS_TOKEN en las variables de entorno.');
+  }
+
+  try {
+    // 1. Obtener URL temporal de descarga desde Meta
+    const metaRes = await axios.get(`https://graph.facebook.com/v22.0/${mediaId}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+
+    const downloadUrl = metaRes.data.url;
+
+    // 2. Descargar el binario del archivo
+    const mediaResponse = await axios.get(downloadUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+      responseType: 'arraybuffer'
+    });
+
+    // 3. Determinar extensión por el Content-Type
+    const mimeType = mediaResponse.headers['content-type'] || '';
+    let ext = 'bin';
+    if (mimeType.includes('image/jpeg')) ext = 'jpg';
+    else if (mimeType.includes('image/png')) ext = 'png';
+    else if (mimeType.includes('image/webp')) ext = 'webp';
+    else if (mimeType.includes('audio/ogg')) ext = 'ogg';
+    else if (mimeType.includes('audio/mpeg')) ext = 'mp3';
+    else if (mimeType.includes('audio/aac')) ext = 'aac';
+    else if (mimeType.includes('application/pdf')) ext = 'pdf';
+
+    // 4. Asegurar la creación de la carpeta pública de descargas
+    const uploadsFolder = path.join(__dirname, 'public', 'uploads');
+    if (!fs.existsSync(uploadsFolder)) {
+      fs.mkdirSync(uploadsFolder, { recursive: true });
+    }
+
+    const fileName = `${mediaId}.${ext}`;
+    const filePath = path.join(uploadsFolder, fileName);
+
+    fs.writeFileSync(filePath, mediaResponse.data);
+
+    // Devuelve la URL estática relativa que Express servirá al frontend
+    return `/uploads/${fileName}`;
+  } catch (error) {
+    console.error('❌ Error al descargar archivo multimedia de Meta:', error.message);
+    throw error;
+  }
+}
+
 module.exports = {
   enviarPlantillaWhatsApp,
   enviarTextoLibreWhatsApp,
   enviarImagenWhatsApp,
-  enviarDocumentoWhatsApp
+  enviarDocumentoWhatsApp,
+  descargarMediaWhatsApp
 };

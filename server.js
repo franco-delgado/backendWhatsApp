@@ -6,11 +6,13 @@ require("dotenv").config();
 
 const express = require('express');
 const cors = require("cors");
+const path = require("path");
 const { 
   enviarPlantillaWhatsApp, 
   enviarTextoLibreWhatsApp, 
   enviarImagenWhatsApp, 
-  enviarDocumentoWhatsApp 
+  enviarDocumentoWhatsApp,
+  descargarMediaWhatsApp 
 } = require("./whatsappService");
 
 const app = express();
@@ -20,7 +22,6 @@ const PORT = process.env.PORT || 3000;
 // MIDDLEWARES GENERALES Y CORS
 // ==========================================
 
-// Configuración de CORS restringida a los dominios autorizados
 app.use(cors({
   origin: [
     'https://whatsapp-multidestinos.onrender.com', // Frontend en Render
@@ -34,6 +35,9 @@ app.use(cors({
 
 app.use(express.json());
 
+// Servir archivos descargados (Imágenes / Audios) de forma pública
+app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
+
 // Middleware para bypass de la pantalla de advertencia de localtunnel
 app.use((req, res, next) => {
   res.setHeader('Bypass-Tunnel-Reminder', 'true');
@@ -43,15 +47,11 @@ app.use((req, res, next) => {
 // ==========================================
 // ALMACENAMIENTO EN MEMORIA DE MENSAJES
 // ==========================================
-// Mantiene los mensajes recibidos para ser consultados desde el Frontend
 let mensajesRecibidos = [];
 
-// Helper para pausar ejecuciones en envíos masivos y no saturar la API de Meta
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Función auxiliar para enrutar según el tipo de mensaje solicitado
 async function procesarEnvio(payload) {
-  // Extraemos datos tolerando distintas convenciones de nombres desde el frontend
   const number = payload.number || payload.to || payload.phone;
   const type = payload.type || 'template';
   const parameters = payload.parameters || payload.params || [];
@@ -64,22 +64,12 @@ async function procesarEnvio(payload) {
 
   switch (type) {
     case 'template':
-      // 🔍 LOG DE CONTROL EN CONSOLA
       console.log(`[procesarEnvio] Solicitado template: "${templateName}" para destino: ${number}`);
-      
-      return await enviarPlantillaWhatsApp(
-        number, 
-        parameters, 
-        templateName, // Pasa directamente el nombre extraído del cliente
-        languageCode
-      );
+      return await enviarPlantillaWhatsApp(number, parameters, templateName, languageCode);
     
     case 'text':
       if (!payload.text) throw new Error("Para mensajes de tipo 'text', el campo 'text' es obligatorio.");
-      
-      // Capturamos la variable contextMessageId si el frontend la manda para citar mensajes
       const contextMessageId = payload.contextMessageId || payload.context_message_id || null;
-      
       return await enviarTextoLibreWhatsApp(number, payload.text, contextMessageId);
     
     case 'image':
@@ -108,7 +98,6 @@ app.get("/status", (req, res) => {
 
 // ENDPOINTS PARA EL FRONTEND (BANDEJA DE ENTRADA)
 
-// Obtener todos los mensajes recibidos
 app.get("/api/mensajes", (req, res) => {
   res.json({
     success: true,
@@ -117,7 +106,6 @@ app.get("/api/mensajes", (req, res) => {
   });
 });
 
-// Vaciar bandeja de entrada
 app.delete("/api/mensajes", (req, res) => {
   mensajesRecibidos = [];
   res.json({
@@ -126,11 +114,9 @@ app.delete("/api/mensajes", (req, res) => {
   });
 });
 
-// Responder a un mensaje desde la interfaz de React
 app.post("/api/mensajes/responder", async (req, res) => {
   try {
     const { to, number, messageText, text, contextMessageId } = req.body;
-
     const destinatario = to || number;
     const mensaje = messageText || text;
 
@@ -164,10 +150,8 @@ app.post("/api/mensajes/responder", async (req, res) => {
 
 // WEBHOOK PARA META (VERIFICACIÓN Y RECEPCIÓN)
 
-// 1. GET /webhook: Para la verificación inicial del Webhook desde el panel de Meta Developers
 app.get("/webhook", (req, res) => {
   const verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
-
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
@@ -185,66 +169,78 @@ app.get("/webhook", (req, res) => {
 });
 
 // 2. POST /webhook: Para recibir los estados de los mensajes y respuestas de usuarios
-app.post("/webhook", (req, res) => {
+app.post("/webhook", async (req, res) => {
   const body = req.body;
 
   if (body.object === "whatsapp_business_account") {
     // Responder a Meta inmediatamente con 200 OK para evitar reintentos duplicados
     res.status(200).send("EVENT_RECEIVED");
 
-    // Procesar evento en segundo plano
-    body.entry?.forEach((entry) => {
-      const changes = entry.changes;
-      changes?.forEach((change) => {
-        const value = change.value;
+    if (body.entry) {
+      for (const entry of body.entry) {
+        if (!entry.changes) continue;
+        for (const change of entry.changes) {
+          const value = change.value;
 
-        // Caso A: Notificación de estados de entrega (sent, delivered, read, failed)
-        if (value?.statuses) {
-          value.statuses.forEach((status) => {
-            console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status} | Destino: ${status.recipient_id}`);
-            if (status.status === "failed") {
-              console.error("[Status Error Details]:", JSON.stringify(status.errors, null, 2));
+          // Caso A: Notificación de estados de entrega (sent, delivered, read, failed)
+          if (value?.statuses) {
+            value.statuses.forEach((status) => {
+              console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status} | Destino: ${status.recipient_id}`);
+              if (status.status === "failed") {
+                console.error("[Status Error Details]:", JSON.stringify(status.errors, null, 2));
+              }
+            });
+          }
+
+          // Caso B: El usuario responde un mensaje
+          if (value?.messages) {
+            for (const msg of value.messages) {
+              console.log(`[Mensaje Recibido] De: ${msg.from} | Tipo: ${msg.type}`);
+              
+              const contactName = value.contacts?.[0]?.profile?.name || "Desconocido";
+              let contenido = "";
+
+              // Procesar según el tipo de mensaje recibido
+              if (msg.type === "text") {
+                contenido = msg.text.body;
+              } else if (msg.type === "image" && msg.image?.id) {
+                try {
+                  contenido = await descargarMediaWhatsApp(msg.image.id);
+                } catch (err) {
+                  contenido = "[Error al descargar imagen]";
+                }
+              } else if (msg.type === "audio" && msg.audio?.id) {
+                try {
+                  contenido = await descargarMediaWhatsApp(msg.audio.id);
+                } catch (err) {
+                  contenido = "[Error al descargar audio]";
+                }
+              } else {
+                contenido = `[Mensaje de tipo: ${msg.type}]`;
+              }
+
+              const nuevoMensaje = {
+                id: msg.id,
+                from: msg.from,
+                nombre: contactName,
+                type: msg.type,
+                text: contenido, // Si es media, contiene la URL pública local (/uploads/xxx.ext)
+                timestamp: new Date(parseInt(msg.timestamp) * 1000).toISOString(),
+              };
+
+              mensajesRecibidos.unshift(nuevoMensaje);
             }
-          });
+          }
         }
-
-        // Caso B: El usuario responde un mensaje
-        if (value?.messages) {
-          value.messages.forEach((msg) => {
-            console.log(`[Mensaje Recibido] De: ${msg.from} | Tipo: ${msg.type}`);
-            
-            // Extraer el nombre del contacto si viene en el payload
-            const contactName = value.contacts?.[0]?.profile?.name || "Desconocido";
-
-            const nuevoMensaje = {
-              id: msg.id,
-              from: msg.from,
-              nombre: contactName,
-              type: msg.type,
-              text: msg.type === "text" ? msg.text.body : `[Mensaje de tipo: ${msg.type}]`,
-              timestamp: new Date(parseInt(msg.timestamp) * 1000).toISOString(),
-            };
-
-            if (msg.type === "text") {
-              console.log(`[Texto]: ${msg.text.body}`);
-            }
-
-            // Almacenar el mensaje al inicio del arreglo
-            mensajesRecibidos.unshift(nuevoMensaje);
-          });
-        }
-      });
-    });
+      }
+    }
   } else {
     res.sendStatus(404);
   }
 });
 
-// ==========================================
 // ENDPOINTS DE ENVÍO
-// ==========================================
 
-// Endpoint de envío individual (soporta plantillas, texto libre, imágenes, PDFs)
 app.post("/send", async (req, res) => {
   try {
     const result = await procesarEnvio(req.body);
@@ -263,7 +259,6 @@ app.post("/send", async (req, res) => {
   }
 });
 
-// Endpoint de envío masivo con control de pacing (delay)
 app.post("/send-bulk", async (req, res) => {
   const { contacts, delayMs = 200 } = req.body; 
 
@@ -280,7 +275,6 @@ app.post("/send-bulk", async (req, res) => {
     const contact = contacts[i];
 
     try {
-      // Pasa el objeto 'contact' entero para que procesarEnvio extraiga todo limpiamente
       const response = await procesarEnvio(contact);
 
       results.push({
@@ -296,7 +290,6 @@ app.post("/send-bulk", async (req, res) => {
       });
     }
 
-    // Aplicar pausa entre peticiones para respetar Rate Limits
     if (i < contacts.length - 1) {
       await delay(delayMs);
     }
