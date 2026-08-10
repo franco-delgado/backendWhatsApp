@@ -49,40 +49,103 @@ function _limpiarNumero(numero) {
 // MÉTODOS PÚBLICOS DE ENVÍO
 // ==========================================
 
-async function enviarPlantillaWhatsApp(numeroDestino, parametros = [], templateName, languageCode = 'es_AR') {
+/**
+ * Envía una plantilla de WhatsApp.
+ *
+ * `componentesOParametros` acepta 3 formatos:
+ *  1) Array de componentes ya armados por Meta: [{ type: 'header', parameters: [...] }, ...]
+ *  2) Objeto { header, body } -> arma un componente 'header' y uno 'body', cada uno
+ *     con su propio parámetro de texto. Usado por ej. en la plantilla "invitacion" o "alta".
+ *  3) Array de strings sueltos -> se mandan todos como parámetros del 'body'
+ *     (en orden, {{1}}, {{2}}, ...). Usado por ej. en la plantilla "mensaje_mensual".
+ */
+async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [], templateName, languageCode = 'es_AR') {
   const cleanNumber = _limpiarNumero(numeroDestino);
-
   const nombrePlantilla = templateName;
+
   const templatePayload = {
     name: nombrePlantilla,
     language: { code: languageCode }
   };
 
-  if (Array.isArray(parametros) && parametros.length > 0) {
-    if (nombrePlantilla === 'invitacion' && parametros.length >= 2) {
-      const [headerText, ...bodyTexts] = parametros;
+  // 1️⃣ Ya vienen componentes estructurados de Meta (cada item con "type")
+  if (Array.isArray(componentesOParametros) && componentesOParametros[0]?.type) {
+    templatePayload.components = componentesOParametros;
+  }
+  // 2️⃣ Objeto { header, body } (ej: plantilla "invitacion" o "alta")
+  else if (
+    componentesOParametros &&
+    typeof componentesOParametros === 'object' &&
+    !Array.isArray(componentesOParametros) &&
+    (componentesOParametros.header !== undefined || componentesOParametros.body !== undefined)
+  ) {
+    const components = [];
 
+    // Header
+    if (componentesOParametros.header !== undefined && String(componentesOParametros.header).trim() !== '') {
+      components.push({
+        type: 'header',
+        parameters: [{ type: 'text', text: String(componentesOParametros.header).trim() }]
+      });
+    }
+
+    // Body (soporta string único o array con múltiples variables)
+    if (componentesOParametros.body !== undefined) {
+      let bodyParams = [];
+
+      if (Array.isArray(componentesOParametros.body)) {
+        bodyParams = componentesOParametros.body
+          .filter(val => val !== null && val !== undefined)
+          .map(val => ({ type: 'text', text: String(val).trim() }));
+      } else if (String(componentesOParametros.body).trim() !== '') {
+        bodyParams = [{ type: 'text', text: String(componentesOParametros.body).trim() }];
+      }
+
+      if (bodyParams.length > 0) {
+        components.push({
+          type: 'body',
+          parameters: bodyParams
+        });
+      }
+    }
+
+    templatePayload.components = components;
+  }
+  // 3️⃣ Array de parámetros sueltos (ej: plantilla "mensaje_mensual") u otros formatos legacy
+  else {
+    let params = [];
+
+    if (Array.isArray(componentesOParametros)) {
+      params = componentesOParametros;
+    } else if (componentesOParametros && typeof componentesOParametros === 'object') {
+      params = componentesOParametros.parametros ||
+               componentesOParametros.params ||
+               componentesOParametros.components || [];
+    } else if (typeof componentesOParametros === 'string' && componentesOParametros.trim() !== '') {
+      params = [componentesOParametros];
+    }
+
+    params = params.filter(p => p !== null && p !== undefined).map(p => String(p).trim());
+
+    if (params.length > 0) {
       templatePayload.components = [
         {
-          type: 'header',
-          parameters: [
-            { type: 'text', text: String(headerText) }
-          ]
-        },
-        {
           type: 'body',
-          parameters: bodyTexts.map(texto => ({ type: 'text', text: String(texto) }))
+          parameters: params.map(texto => ({ type: 'text', text: texto }))
         }
       ];
     } else {
+      // Respaldo de seguridad si no llegó ningún parámetro
       templatePayload.components = [
         {
           type: 'body',
-          parameters: parametros.map(texto => ({ type: 'text', text: String(texto) }))
+          parameters: [{ type: 'text', text: 'Franco' }]
         }
       ];
     }
   }
+
+  console.log("📤 PAYLOAD REAL ENVIADO A META:", JSON.stringify(templatePayload, null, 2));
 
   return await _enviarPeticionMeta({
     messaging_product: 'whatsapp',

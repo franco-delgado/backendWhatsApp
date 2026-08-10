@@ -1,88 +1,48 @@
-/**
- * server.js
- * Servidor Node.js para producción con WhatsApp Business Cloud API (Meta).
- */
+// Servidor Node.js para producción con WhatsApp Business Cloud API (Meta).
 require("dotenv").config();
+const dns = require("dns");
+dns.setServers(["8.8.8.8", "8.8.4.4"]);
+dns.setDefaultResultOrder("ipv4first");
 
 const express = require('express');
 const cors = require("cors");
 const path = require("path");
-const { 
-  enviarPlantillaWhatsApp, 
-  enviarTextoLibreWhatsApp, 
-  enviarImagenWhatsApp, 
-  enviarDocumentoWhatsApp,
-  descargarMediaWhatsApp 
-} = require("./whatsappService");
+const mongoose = require("mongoose");
+
+// Módulos modularizados
+const { descargarMediaWhatsApp } = require("./whatsappService");
+const { enviarMensajeFirebase } = require("./conexionFB"); // Conexión a Firebase
+const Mensaje = require("./models/Mensaje");              // Modelo MongoDB
+const { procesarEnvio } = require("./utils/whatsappProcessor");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ==========================================
-// MIDDLEWARES GENERALES Y CORS
-// ==========================================
+// CONEXIÓN A MONGODB
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/whatsapp_db';
+mongoose.connect(MONGO_URI)
+  .then(() => console.log('✅ Conectado exitosamente a la Base de Datos MongoDB'))
+  .catch((err) => console.error('❌ Error de conexión a MongoDB:', err.message));
 
+// MIDDLEWARES GENERALES
 app.use(cors({
-  origin: '*', // Permite peticiones desde cualquier origen (o mantén tu dominio de frontend)
+  origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Bypass-Tunnel-Reminder'],
   credentials: true
 }));
 
 app.use(express.json());
-
-// Servir archivos descargados (Imágenes / Audios) de forma pública
 app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
-// Middleware para bypass de la pantalla de advertencia de localtunnel
 app.use((req, res, next) => {
   res.setHeader('Bypass-Tunnel-Reminder', 'true');
   next();
 });
 
-// ==========================================
-// ALMACENAMIENTO EN MEMORIA DE MENSAJES
-// ==========================================
-let mensajesRecibidos = [];
-
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function procesarEnvio(payload) {
-  const number = payload.number || payload.to || payload.phone;
-  const type = payload.type || 'template';
-  const parameters = payload.parameters || payload.params || [];
-  const templateName = payload.templateName || payload.template_name || payload.template;
-  const languageCode = payload.languageCode || payload.language_code || 'es_AR';
-
-  if (!number) {
-    throw new Error("El parámetro 'number' (o 'to') es obligatorio.");
-  }
-
-  switch (type) {
-    case 'template':
-      console.log(`[procesarEnvio] Solicitado template: "${templateName}" para destino: ${number}`);
-      return await enviarPlantillaWhatsApp(number, parameters, templateName, languageCode);
-    
-    case 'text':
-      if (!payload.text) throw new Error("Para mensajes de tipo 'text', el campo 'text' es obligatorio.");
-      const contextMessageId = payload.contextMessageId || payload.context_message_id || null;
-      return await enviarTextoLibreWhatsApp(number, payload.text, contextMessageId);
-    
-    case 'image':
-      if (!payload.mediaUrl) throw new Error("Para tipo 'image', el campo 'mediaUrl' es obligatorio.");
-      return await enviarImagenWhatsApp(number, payload.mediaUrl, payload.caption || '');
-    
-    case 'document':
-      if (!payload.mediaUrl) throw new Error("Para tipo 'document', el campo 'mediaUrl' es obligatorio.");
-      return await enviarDocumentoWhatsApp(number, payload.mediaUrl, payload.filename || 'archivo.pdf', payload.caption || '');
-    
-    default:
-      throw new Error(`Tipo de mensaje no soportado: '${type}'.`);
-  }
-}
-
 // ENDPOINTS DE UTILIDAD Y SALUD
-
 app.get("/status", (req, res) => {
   res.json({
     status: "connected",
@@ -92,22 +52,25 @@ app.get("/status", (req, res) => {
   });
 });
 
-// ENDPOINTS PARA EL FRONTEND (BANDEJA DE ENTRADA)
-
-app.get("/api/mensajes", (req, res) => {
-  res.json({
-    success: true,
-    total: mensajesRecibidos.length,
-    data: mensajesRecibidos,
-  });
+// ENDPOINTS PARA EL FRONTEND
+app.get("/api/mensajes", async (req, res) => {
+  try {
+    const mensajes = await Mensaje.find().sort({ timestamp: -1 });
+    res.json({ success: true, total: mensajes.length, data: mensajes });
+  } catch (error) {
+    console.error("[Servidor] Error al consultar mensajes de BD:", error.message);
+    res.status(500).json({ success: false, error: "Error al consultar mensajes." });
+  }
 });
 
-app.delete("/api/mensajes", (req, res) => {
-  mensajesRecibidos = [];
-  res.json({
-    success: true,
-    message: "Historial de mensajes limpiado.",
-  });
+app.delete("/api/mensajes", async (req, res) => {
+  try {
+    await Mensaje.deleteMany({});
+    res.json({ success: true, message: "Historial de mensajes limpiado de la base de datos." });
+  } catch (error) {
+    console.error("[Servidor] Error al vaciar historial de BD:", error.message);
+    res.status(500).json({ success: false, error: "Error al limpiar historial." });
+  }
 });
 
 app.post("/api/mensajes/responder", async (req, res) => {
@@ -130,47 +93,63 @@ app.post("/api/mensajes/responder", async (req, res) => {
       contextMessageId: contextMessageId || null
     });
 
-    res.json({
-      success: true,
-      message: "Respuesta enviada con éxito.",
-      data: result,
-    });
+    const respuestaId = result?.messages?.[0]?.id || `out_${Date.now()}`;
+    const nuevoMensajeOut = {
+      id: respuestaId,
+      from: 'me',
+      to: destinatario,
+      nombre: 'Soporte',
+      type: 'text_out',
+      text: mensaje,
+      timestamp: new Date().toISOString()
+    };
+
+    // 1. Guardar en MongoDB sin duplicar
+    try {
+      await Mensaje.updateOne(
+        { id: respuestaId },
+        { $setOnInsert: nuevoMensajeOut },
+        { upsert: true }
+      );
+    } catch (dbErr) {
+      console.error("[MongoDB Outbound Error]:", dbErr.message);
+    }
+
+    // 2. Sincronizar en Firebase sin duplicar
+    try {
+      await enviarMensajeFirebase(nuevoMensajeOut);
+      console.log(`🔥 Respuesta ${respuestaId} sincronizada en Firebase.`);
+    } catch (fbErr) {
+      console.error("[Firebase Outbound Error]:", fbErr);
+    }
+
+    res.json({ success: true, message: "Respuesta enviada con éxito.", data: result });
   } catch (err) {
     console.error("[Servidor] Error en /api/mensajes/responder:", err.message);
-    res.status(400).json({
-      success: false,
-      error: err.message,
-    });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
-// WEBHOOK PARA META (VERIFICACIÓN Y RECEPCIÓN)
-
+// WEBHOOK PARA META
 app.get("/webhook", (req, res) => {
   const verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode && token) {
-    if (mode === "subscribe" && token === verifyToken) {
-      console.log("[Webhook] Verificado con éxito por Meta.");
-      return res.status(200).send(challenge);
-    } else {
-      console.warn("[Webhook] Falló la verificación. Token incorrecto.");
-      return res.sendStatus(403);
-    }
+  if (mode && token && mode === "subscribe" && token === verifyToken) {
+    console.log("[Webhook] Verificado con éxito por Meta.");
+    return res.status(200).send(challenge);
   }
-  res.sendStatus(400);
+  res.sendStatus(403);
 });
 
-// POST /webhook: Para recibir los estados de los mensajes y respuestas de usuarios
 app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
 
     if (body.object === "whatsapp_business_account") {
-      // Responder a Meta INMEDIATAMENTE para evitar retries o timeouts (200 OK)
+      // Confirmar inmediatamente a Meta para evitar retintentos
       res.status(200).send("EVENT_RECEIVED");
 
       if (body.entry) {
@@ -179,26 +158,20 @@ app.post("/webhook", async (req, res) => {
           for (const change of entry.changes) {
             const value = change.value;
 
-            // Caso A: Notificación de estados de entrega (sent, delivered, read, failed)
+            // Caso A: Estados de entrega
             if (value?.statuses) {
               value.statuses.forEach((status) => {
-                console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status} | Destino: ${status.recipient_id}`);
-                if (status.status === "failed") {
-                  console.error("[Status Error Details]:", JSON.stringify(status.errors, null, 2));
-                }
+                console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status}`);
               });
             }
 
-            // Caso B: El usuario envía un mensaje
+            // Caso B: Recepción de mensajes
             if (value?.messages) {
               for (const msg of value.messages) {
-                console.log(`[Mensaje Recibido] De: ${msg.from} | Tipo: ${msg.type}`);
-                
                 const contactObj = value.contacts?.find(c => c.wa_id === msg.from);
                 const contactName = contactObj?.profile?.name || "Desconocido";
                 let contenido = "";
 
-                // Procesar según el tipo de mensaje recibido
                 if (msg.type === "text" && msg.text?.body) {
                   contenido = msg.text.body;
                 } else if (msg.type === "button" && msg.button?.text) {
@@ -206,34 +179,58 @@ app.post("/webhook", async (req, res) => {
                 } else if (msg.type === "interactive") {
                   contenido = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || "[Respuesta Interactiva]";
                 } else if (msg.type === "image" && msg.image?.id) {
-                  try {
-                    contenido = await descargarMediaWhatsApp(msg.image.id);
-                  } catch (err) {
-                    contenido = "[Error al descargar imagen]";
+                  try { 
+                    contenido = await descargarMediaWhatsApp(msg.image.id); 
+                  } catch (e) { 
+                    console.error("[Media Error Imagen]:", e.message);
+                    contenido = "[Error al descargar imagen]"; 
                   }
                 } else if (msg.type === "audio" && msg.audio?.id) {
-                  try {
-                    contenido = await descargarMediaWhatsApp(msg.audio.id);
-                  } catch (err) {
-                    contenido = "[Error al descargar audio]";
+                  try { 
+                    contenido = await descargarMediaWhatsApp(msg.audio.id); 
+                  } catch (e) { 
+                    console.error("[Media Error Audio]:", e.message);
+                    contenido = "[Error al descargar audio]"; 
                   }
                 } else {
                   contenido = `[Mensaje de tipo: ${msg.type}]`;
                 }
 
+                // Generación de identificador único y normalización
+                const mensajeId = msg.id || `msg_${Date.now()}`;
+                const timestampVal = msg.timestamp ? parseInt(msg.timestamp) * 1000 : Date.now();
+                
                 const nuevoMensaje = {
-                  id: msg.id,
+                  id: mensajeId,
                   from: msg.from,
                   nombre: contactName,
                   type: msg.type,
-                  text: contenido, // Contiene texto o la URL pública local (/uploads/xxx.ext)
-                  timestamp: new Date(parseInt(msg.timestamp) * 1000).toISOString(),
+                  text: contenido,
+                  timestamp: new Date(timestampVal).toISOString()
                 };
 
-                // Evitar duplicados por reintentos de Meta
-                const yaExiste = mensajesRecibidos.some(m => m.id === msg.id);
-                if (!yaExiste) {
-                  mensajesRecibidos.unshift(nuevoMensaje);
+                // 1. Guardar en MongoDB (Previene duplicación con upsert en 'id')
+                try {
+                  const result = await Mensaje.updateOne(
+                    { id: mensajeId },
+                    { $setOnInsert: nuevoMensaje },
+                    { upsert: true }
+                  );
+                  if (result.upsertedCount > 0) {
+                    console.log(`💾 Nuevo mensaje ${mensajeId} guardado en MongoDB.`);
+                  } else {
+                    console.log(`ℹ️ Mensaje ${mensajeId} ya existía en MongoDB (Duplicado omitido).`);
+                  }
+                } catch (dbErr) {
+                  console.error("[MongoDB Error]:", dbErr.message);
+                }
+
+                // 2. Guardar en Firebase Realtime Database
+                try {
+                  await enviarMensajeFirebase(nuevoMensaje);
+                  console.log(`🔥 Mensaje ${mensajeId} guardado con éxito en Firebase DB_mensajes.`);
+                } catch (fbErr) {
+                  console.error("[Firebase Error Detallado]:", fbErr);
                 }
               }
             }
@@ -244,74 +241,43 @@ app.post("/webhook", async (req, res) => {
       res.sendStatus(404);
     }
   } catch (error) {
-    console.error("[Webhook Error]: Fallo al procesar evento:", error);
-    if (!res.headersSent) {
-      res.status(200).send("EVENT_RECEIVED");
-    }
+    console.error("[Webhook Error]:", error);
+    if (!res.headersSent) res.status(200).send("EVENT_RECEIVED");
   }
 });
 
 // ENDPOINTS DE ENVÍO
-
 app.post("/send", async (req, res) => {
   try {
     const result = await procesarEnvio(req.body);
-
-    res.json({
-      success: true,
-      message: "Mensaje procesado con éxito.",
-      data: result,
-    });
+    res.json({ success: true, message: "Mensaje procesado con éxito.", data: result });
   } catch (err) {
     console.error("[Servidor] Error en /send:", err.message);
-    res.status(400).json({
-      success: false,
-      error: err.message,
-    });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
 app.post("/send-bulk", async (req, res) => {
-  const { contacts, delayMs = 200 } = req.body; 
+  const { contacts, delayMs = 200 } = req.body;
 
   if (!Array.isArray(contacts) || contacts.length === 0) {
-    return res.status(400).json({
-      success: false,
-      error: "Se requiere un arreglo 'contacts' válido y no vacío.",
-    });
+    return res.status(400).json({ success: false, error: "Se requiere un arreglo 'contacts' válido." });
   }
 
   const results = [];
-
   for (let i = 0; i < contacts.length; i++) {
     const contact = contacts[i];
-
     try {
       const response = await procesarEnvio(contact);
-
-      results.push({
-        number: contact.number || contact.to,
-        status: "success",
-        response,
-      });
+      results.push({ number: contact.number || contact.to, status: "success", response });
     } catch (err) {
-      results.push({
-        number: contact.number || contact.to,
-        status: "error",
-        error: err.message,
-      });
+      results.push({ number: contact.number || contact.to, status: "error", error: err.message });
     }
 
-    if (i < contacts.length - 1) {
-      await delay(delayMs);
-    }
+    if (i < contacts.length - 1) await delay(delayMs);
   }
 
-  res.json({
-    success: true,
-    processed: results.length,
-    results,
-  });
+  res.json({ success: true, processed: results.length, results });
 });
 
 app.listen(PORT, () => {
