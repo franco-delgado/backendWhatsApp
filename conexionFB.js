@@ -34,10 +34,15 @@ async function enviarMensajeFirebase(mensajeObj) {
     throw new Error("[Firebase] El objeto debe incluir un 'id' válido.");
   }
 
-  const mensajeRef = db.ref(`DB_mensajes/${mensajeObj.id}`);
+  // Sanitizar el ID reemplazando los caracteres no permitidos por Firebase ( . # $ [ ] )
+  const idSanitizado = String(mensajeObj.id).replace(/[.#$\[\]]/g, '_');
+
+  // Apuntar al nodo usando el ID limpio
+  const mensajeRef = db.ref(`DB_mensajes/${idSanitizado}`);
 
   return await mensajeRef.set({
     ...mensajeObj,
+    idOriginal: mensajeObj.id, // Conservar el ID original intacto en las propiedades
     fechaCreacion: new Date().toISOString()
   });
 }
