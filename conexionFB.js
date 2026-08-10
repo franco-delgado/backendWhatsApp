@@ -1,7 +1,24 @@
 const { initializeApp, cert, getApps } = require('firebase-admin/app');
 const { getDatabase } = require('firebase-admin/database');
+const fs = require('fs');
+const path = require('path');
 
-const serviceAccount = require('./serviceAccountKey.json');
+let serviceAccount;
+
+// 1. Intentar cargar desde Secret Files de Render (/etc/secrets/serviceAccountKey.json)
+const renderSecretPath = '/etc/secrets/serviceAccountKey.json';
+// 2. Intentar cargar desde el directorio raíz local
+const localPath = path.join(__dirname, 'serviceAccountKey.json');
+
+if (fs.existsSync(renderSecretPath)) {
+  serviceAccount = JSON.parse(fs.readFileSync(renderSecretPath, 'utf8'));
+} else if (fs.existsSync(localPath)) {
+  serviceAccount = require('./serviceAccountKey.json');
+} else if (process.env.FIREBASE_CREDENTIALS) {
+  serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+} else {
+  throw new Error('[Firebase Error] No se encontraron credenciales de servicio.');
+}
 
 if (!getApps().length) {
   initializeApp({
@@ -17,10 +34,8 @@ async function enviarMensajeFirebase(mensajeObj) {
     throw new Error("[Firebase] El objeto debe incluir un 'id' válido.");
   }
 
-  // Se apunta directamente al nodo del mensaje usando su ID único de WhatsApp
   const mensajeRef = db.ref(`DB_mensajes/${mensajeObj.id}`);
 
-  // .set() crea el nodo o lo actualiza si ya existe, evitando duplicados
   return await mensajeRef.set({
     ...mensajeObj,
     fechaCreacion: new Date().toISOString()
