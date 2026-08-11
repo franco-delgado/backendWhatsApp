@@ -7,6 +7,7 @@ dns.setDefaultResultOrder("ipv4first");
 const express = require('express');
 const cors = require("cors");
 const path = require("path");
+const fs = require("fs");
 const mongoose = require("mongoose");
 
 // Módulos modularizados
@@ -52,7 +53,11 @@ app.get("/status", (req, res) => {
   });
 });
 
-// ENDPOINTS PARA EL FRONTEND
+// =========================================================================
+// ENDPOINTS DE MENSAJES (FRONTEND)
+// =========================================================================
+
+// 1. Obtener todos los mensajes
 app.get("/api/mensajes", async (req, res) => {
   try {
     const mensajes = await Mensaje.find().sort({ timestamp: -1 });
@@ -63,6 +68,48 @@ app.get("/api/mensajes", async (req, res) => {
   }
 });
 
+// 2. Eliminar un mensaje individual por ID (_id de Mongo o id de WhatsApp)
+app.delete("/api/mensajes/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log(`[DELETE] Solicitud para eliminar mensaje ID: ${id}`);
+
+    // Búsqueda flexible (por _id de Mongo o id string de WhatsApp)
+    const orConditions = [{ id: id }];
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      orConditions.push({ _id: new mongoose.Types.ObjectId(id) });
+    }
+
+    const mensajeAEliminar = await Mensaje.findOne({ $or: orConditions });
+
+    if (!mensajeAEliminar) {
+      console.log(`[DELETE 404] Mensaje no encontrado con ID: ${id}`);
+      return res.status(404).json({ success: false, error: "Mensaje no encontrado." });
+    }
+
+    // Borrar archivo adjunto si existía en servidor local
+    if (mensajeAEliminar.mediaUrl && mensajeAEliminar.mediaUrl.startsWith('/uploads/')) {
+      const rutaArchivo = path.join(__dirname, 'public', mensajeAEliminar.mediaUrl);
+      if (fs.existsSync(rutaArchivo)) {
+        fs.unlink(rutaArchivo, (err) => {
+          if (err) console.error(`[Archivos] Error al eliminar ${rutaArchivo}:`, err);
+          else console.log(`🗑️ Archivo local borrado: ${rutaArchivo}`);
+        });
+      }
+    }
+
+    // Borrar el documento de MongoDB
+    await Mensaje.deleteOne({ _id: mensajeAEliminar._id });
+
+    console.log(`✅ Mensaje ${id} eliminado con éxito de MongoDB.`);
+    return res.json({ success: true, message: "Mensaje eliminado con éxito." });
+  } catch (error) {
+    console.error("[Servidor] Error al eliminar mensaje individual:", error.message);
+    res.status(500).json({ success: false, error: "Error interno al eliminar el mensaje." });
+  }
+});
+
+// 3. Vaciar todo el historial de mensajes
 app.delete("/api/mensajes", async (req, res) => {
   try {
     await Mensaje.deleteMany({});
@@ -73,6 +120,7 @@ app.delete("/api/mensajes", async (req, res) => {
   }
 });
 
+// 4. Responder a un mensaje
 app.post("/api/mensajes/responder", async (req, res) => {
   try {
     const { to, number, messageText, text, contextMessageId } = req.body;
@@ -104,7 +152,7 @@ app.post("/api/mensajes/responder", async (req, res) => {
       timestamp: new Date().toISOString()
     };
 
-    // 1. Guardar en MongoDB sin duplicar
+    // Guardar en MongoDB sin duplicar
     try {
       await Mensaje.updateOne(
         { id: respuestaId },
@@ -115,7 +163,7 @@ app.post("/api/mensajes/responder", async (req, res) => {
       console.error("[MongoDB Outbound Error]:", dbErr.message);
     }
 
-    // 2. Sincronizar en Firebase sin duplicar
+    // Sincronizar en Firebase sin duplicar
     try {
       await enviarMensajeFirebase(nuevoMensajeOut);
       console.log(`🔥 Respuesta ${respuestaId} sincronizada en Firebase.`);
@@ -130,7 +178,10 @@ app.post("/api/mensajes/responder", async (req, res) => {
   }
 });
 
-// WEBHOOK PARA META
+// =========================================================================
+// WEBHOOK DE META (WHATSAPP CLOUD API)
+// =========================================================================
+
 app.get("/webhook", (req, res) => {
   const verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
   const mode = req.query["hub.mode"];
@@ -149,7 +200,6 @@ app.post("/webhook", async (req, res) => {
     const body = req.body;
 
     if (body.object === "whatsapp_business_account") {
-      // Confirmar inmediatamente a Meta para evitar retintentos
       res.status(200).send("EVENT_RECEIVED");
 
       if (body.entry) {
@@ -158,45 +208,45 @@ app.post("/webhook", async (req, res) => {
           for (const change of entry.changes) {
             const value = change.value;
 
-            // Caso A: Estados de entrega
             if (value?.statuses) {
               value.statuses.forEach((status) => {
                 console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status}`);
               });
             }
 
-            // Caso B: Recepción de mensajes
             if (value?.messages) {
               for (const msg of value.messages) {
                 const contactObj = value.contacts?.find(c => c.wa_id === msg.from);
                 const contactName = contactObj?.profile?.name || "Desconocido";
-                let contenido = "";
+                
+                let textoMensaje = "";
+                let mediaUrl = "";
 
                 if (msg.type === "text" && msg.text?.body) {
-                  contenido = msg.text.body;
+                  textoMensaje = msg.text.body;
                 } else if (msg.type === "button" && msg.button?.text) {
-                  contenido = msg.button.text;
+                  textoMensaje = msg.button.text;
                 } else if (msg.type === "interactive") {
-                  contenido = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || "[Respuesta Interactiva]";
+                  textoMensaje = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || "[Respuesta Interactiva]";
                 } else if (msg.type === "image" && msg.image?.id) {
+                  textoMensaje = msg.image?.caption || "";
                   try { 
-                    contenido = await descargarMediaWhatsApp(msg.image.id); 
+                    mediaUrl = await descargarMediaWhatsApp(msg.image.id); 
                   } catch (e) { 
                     console.error("[Media Error Imagen]:", e.message);
-                    contenido = "[Error al descargar imagen]"; 
+                    textoMensaje = "[Error al descargar imagen]"; 
                   }
                 } else if (msg.type === "audio" && msg.audio?.id) {
                   try { 
-                    contenido = await descargarMediaWhatsApp(msg.audio.id); 
+                    mediaUrl = await descargarMediaWhatsApp(msg.audio.id); 
                   } catch (e) { 
                     console.error("[Media Error Audio]:", e.message);
-                    contenido = "[Error al descargar audio]"; 
+                    textoMensaje = "[Error al descargar audio]"; 
                   }
                 } else {
-                  contenido = `[Mensaje de tipo: ${msg.type}]`;
+                  textoMensaje = `[Mensaje de tipo: ${msg.type}]`;
                 }
 
-                // Generación de identificador único y normalización
                 const mensajeId = msg.id || `msg_${Date.now()}`;
                 const timestampVal = msg.timestamp ? parseInt(msg.timestamp) * 1000 : Date.now();
                 
@@ -205,11 +255,11 @@ app.post("/webhook", async (req, res) => {
                   from: msg.from,
                   nombre: contactName,
                   type: msg.type,
-                  text: contenido,
+                  text: textoMensaje,
+                  mediaUrl: mediaUrl,
                   timestamp: new Date(timestampVal).toISOString()
                 };
 
-                // 1. Guardar en MongoDB (Previene duplicación con upsert en 'id')
                 try {
                   const result = await Mensaje.updateOne(
                     { id: mensajeId },
@@ -219,13 +269,12 @@ app.post("/webhook", async (req, res) => {
                   if (result.upsertedCount > 0) {
                     console.log(`💾 Nuevo mensaje ${mensajeId} guardado en MongoDB.`);
                   } else {
-                    console.log(`ℹ️ Mensaje ${mensajeId} ya existía en MongoDB (Duplicado omitido).`);
+                    console.log(`ℹ️ Mensaje ${mensajeId} ya existía en MongoDB.`);
                   }
                 } catch (dbErr) {
                   console.error("[MongoDB Error]:", dbErr.message);
                 }
 
-                // 2. Guardar en Firebase Realtime Database
                 try {
                   await enviarMensajeFirebase(nuevoMensaje);
                   console.log(`🔥 Mensaje ${mensajeId} guardado con éxito en Firebase DB_mensajes.`);
@@ -246,7 +295,10 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ENDPOINTS DE ENVÍO
+// =========================================================================
+// ENDPOINTS DE ENVÍO MASIVO / INDIVIDUAL
+// =========================================================================
+
 app.post("/send", async (req, res) => {
   try {
     const result = await procesarEnvio(req.body);

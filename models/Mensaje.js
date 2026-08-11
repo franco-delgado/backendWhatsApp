@@ -6,6 +6,7 @@ const mensajeSchema = new mongoose.Schema({
   nombre: String,
   type: String,
   text: String,
+  mediaUrl: String,
   timestamp: Date,
 }, { timestamps: true });
 
