@@ -8,6 +8,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.112.3",
     "@whiskeysockets/baileys": "^6.7.9",
     "axios": "^1.18.1",
     "cors": "^2.8.6",

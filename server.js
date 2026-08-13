@@ -1,107 +1,106 @@
-// Servidor Node.js para producción con WhatsApp Business Cloud API (Meta).
+// Servidor Node.js para producción con WhatsApp Business Cloud API (Meta) y Supabase
 require("dotenv").config();
 const dns = require("dns");
 dns.setServers(["8.8.8.8", "8.8.4.4"]);
 dns.setDefaultResultOrder("ipv4first");
 
-const express = require('express');
+const express = require("express");
 const cors = require("cors");
 const path = require("path");
-const fs = require("fs");
-const mongoose = require("mongoose");
+const { createClient } = require("@supabase/supabase-js");
 
 // Módulos modularizados
 const { descargarMediaWhatsApp } = require("./whatsappService");
-const { enviarMensajeFirebase } = require("./conexionFB"); // Conexión a Firebase
-const Mensaje = require("./models/Mensaje");              // Modelo MongoDB
 const { procesarEnvio } = require("./utils/whatsappProcessor");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CONEXIÓN A MONGODB
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/whatsapp_db';
-mongoose.connect(MONGO_URI)
-  .then(() => console.log('✅ Conectado exitosamente a la Base de Datos MongoDB'))
-  .catch((err) => console.error('❌ Error de conexión a MongoDB:', err.message));
+// =========================================================================
+// CONEXIÓN A SUPABASE
+// =========================================================================
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Usa la Service Role Key para evitar bloqueos por RLS
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error("❌ Faltan las variables SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el archivo .env");
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
+console.log("✅ Conectado exitosamente a Supabase");
 
 // MIDDLEWARES GENERALES
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Bypass-Tunnel-Reminder'],
-  credentials: true
-}));
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Bypass-Tunnel-Reminder"],
+    credentials: true,
+  })
+);
 
 app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
 app.use((req, res, next) => {
-  res.setHeader('Bypass-Tunnel-Reminder', 'true');
+  res.setHeader("Bypass-Tunnel-Reminder", "true");
   next();
 });
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ENDPOINTS DE UTILIDAD Y SALUD
+// ENDPOINT DE ESTADO / SALUD
 app.get("/status", (req, res) => {
   res.json({
     status: "connected",
     environment: process.env.NODE_ENV || "production",
-    provider: "Meta WhatsApp Cloud API",
+    provider: "Meta WhatsApp Cloud API + Supabase",
     timestamp: new Date().toISOString(),
   });
 });
 
 // =========================================================================
-// ENDPOINTS DE MENSAJES (FRONTEND)
+// ENDPOINTS DE MENSAJES (FRONTEND / API REST)
 // =========================================================================
 
-// 1. Obtener todos los mensajes
+// 1. Obtener todos los mensajes ordenados por fecha de creación
 app.get("/api/mensajes", async (req, res) => {
   try {
-    const mensajes = await Mensaje.find().sort({ timestamp: -1 });
+    const { data: mensajes, error } = await supabase
+      .from("mensajes")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
     res.json({ success: true, total: mensajes.length, data: mensajes });
   } catch (error) {
-    console.error("[Servidor] Error al consultar mensajes de BD:", error.message);
+    console.error("[Servidor] Error al consultar mensajes de Supabase:", error.message);
     res.status(500).json({ success: false, error: "Error al consultar mensajes." });
   }
 });
 
-// 2. Eliminar un mensaje individual por ID (_id de Mongo o id de WhatsApp)
+// 2. Eliminar un mensaje individual por ID
 app.delete("/api/mensajes/:id", async (req, res) => {
   try {
     const { id } = req.params;
     console.log(`[DELETE] Solicitud para eliminar mensaje ID: ${id}`);
 
-    // Búsqueda flexible (por _id de Mongo o id string de WhatsApp)
-    const orConditions = [{ id: id }];
-    if (mongoose.Types.ObjectId.isValid(id)) {
-      orConditions.push({ _id: new mongoose.Types.ObjectId(id) });
-    }
+    // Eliminar por UUID de Supabase o por identificador de la columna 'id'
+    const { data, error } = await supabase
+      .from("mensajes")
+      .delete()
+      .or(`id.eq.${id},identificacion.eq.${id}`)
+      .select();
 
-    const mensajeAEliminar = await Mensaje.findOne({ $or: orConditions });
+    if (error) throw error;
 
-    if (!mensajeAEliminar) {
+    if (!data || data.length === 0) {
       console.log(`[DELETE 404] Mensaje no encontrado con ID: ${id}`);
       return res.status(404).json({ success: false, error: "Mensaje no encontrado." });
     }
 
-    // Borrar archivo adjunto si existía en servidor local
-    if (mensajeAEliminar.mediaUrl && mensajeAEliminar.mediaUrl.startsWith('/uploads/')) {
-      const rutaArchivo = path.join(__dirname, 'public', mensajeAEliminar.mediaUrl);
-      if (fs.existsSync(rutaArchivo)) {
-        fs.unlink(rutaArchivo, (err) => {
-          if (err) console.error(`[Archivos] Error al eliminar ${rutaArchivo}:`, err);
-          else console.log(`🗑️ Archivo local borrado: ${rutaArchivo}`);
-        });
-      }
-    }
-
-    // Borrar el documento de MongoDB
-    await Mensaje.deleteOne({ _id: mensajeAEliminar._id });
-
-    console.log(`✅ Mensaje ${id} eliminado con éxito de MongoDB.`);
+    console.log(`✅ Mensaje ${id} eliminado con éxito de Supabase.`);
     return res.json({ success: true, message: "Mensaje eliminado con éxito." });
   } catch (error) {
     console.error("[Servidor] Error al eliminar mensaje individual:", error.message);
@@ -112,10 +111,17 @@ app.delete("/api/mensajes/:id", async (req, res) => {
 // 3. Vaciar todo el historial de mensajes
 app.delete("/api/mensajes", async (req, res) => {
   try {
-    await Mensaje.deleteMany({});
-    res.json({ success: true, message: "Historial de mensajes limpiado de la base de datos." });
+    // Borrado general filtrando por registros cuyo ID exista
+    const { error } = await supabase
+      .from("mensajes")
+      .delete()
+      .neq("remitente", "___DUMMY_FILTER___");
+
+    if (error) throw error;
+
+    res.json({ success: true, message: "Historial de mensajes limpiado de Supabase." });
   } catch (error) {
-    console.error("[Servidor] Error al vaciar historial de BD:", error.message);
+    console.error("[Servidor] Error al vaciar historial de Supabase:", error.message);
     res.status(500).json({ success: false, error: "Error al limpiar historial." });
   }
 });
@@ -136,39 +142,27 @@ app.post("/api/mensajes/responder", async (req, res) => {
 
     const result = await procesarEnvio({
       to: destinatario,
-      type: 'text',
+      type: "text",
       text: mensaje,
-      contextMessageId: contextMessageId || null
+      contextMessageId: contextMessageId || null,
     });
 
     const respuestaId = result?.messages?.[0]?.id || `out_${Date.now()}`;
-    const nuevoMensajeOut = {
-      id: respuestaId,
-      from: 'me',
-      to: destinatario,
-      nombre: 'Soporte',
-      type: 'text_out',
-      text: mensaje,
-      timestamp: new Date().toISOString()
-    };
 
-    // Guardar en MongoDB sin duplicar
-    try {
-      await Mensaje.updateOne(
-        { id: respuestaId },
-        { $setOnInsert: nuevoMensajeOut },
-        { upsert: true }
-      );
-    } catch (dbErr) {
-      console.error("[MongoDB Outbound Error]:", dbErr.message);
-    }
+    // Guardar respuesta en Supabase
+    const { error: sbErr } = await supabase.from("mensajes").insert([
+      {
+        remitente: `Soporte (${destinatario})`,
+        cuerpo: mensaje,
+        URL_de_medios: null,
+        tipo_mime: "text/plain",
+      },
+    ]);
 
-    // Sincronizar en Firebase sin duplicar
-    try {
-      await enviarMensajeFirebase(nuevoMensajeOut);
-      console.log(`🔥 Respuesta ${respuestaId} sincronizada en Firebase.`);
-    } catch (fbErr) {
-      console.error("[Firebase Outbound Error]:", fbErr);
+    if (sbErr) {
+      console.error("[Supabase Outbound Error]:", sbErr.message);
+    } else {
+      console.log(`⚡ Respuesta ${respuestaId} guardada en Supabase.`);
     }
 
     res.json({ success: true, message: "Respuesta enviada con éxito.", data: result });
@@ -216,70 +210,64 @@ app.post("/webhook", async (req, res) => {
 
             if (value?.messages) {
               for (const msg of value.messages) {
-                const contactObj = value.contacts?.find(c => c.wa_id === msg.from);
+                const contactObj = value.contacts?.find((c) => c.wa_id === msg.from);
                 const contactName = contactObj?.profile?.name || "Desconocido";
-                
+
                 let textoMensaje = "";
-                let mediaUrl = "";
+                let mediaUrl = null;
+                let mimeType = "text/plain";
 
                 if (msg.type === "text" && msg.text?.body) {
                   textoMensaje = msg.text.body;
+                  mimeType = "text/plain";
                 } else if (msg.type === "button" && msg.button?.text) {
                   textoMensaje = msg.button.text;
                 } else if (msg.type === "interactive") {
-                  textoMensaje = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || "[Respuesta Interactiva]";
+                  textoMensaje =
+                    msg.interactive?.button_reply?.title ||
+                    msg.interactive?.list_reply?.title ||
+                    "[Respuesta Interactiva]";
                 } else if (msg.type === "image" && msg.image?.id) {
                   textoMensaje = msg.image?.caption || "";
-                  try { 
-                    mediaUrl = await descargarMediaWhatsApp(msg.image.id); 
-                  } catch (e) { 
+                  mimeType = msg.image?.mime_type || "image/jpeg";
+                  try {
+                    mediaUrl = await descargarMediaWhatsApp(msg.image.id, mimeType);
+                  } catch (e) {
                     console.error("[Media Error Imagen]:", e.message);
-                    textoMensaje = "[Error al descargar imagen]"; 
+                    textoMensaje = "[Error al descargar imagen]";
                   }
                 } else if (msg.type === "audio" && msg.audio?.id) {
-                  try { 
-                    mediaUrl = await descargarMediaWhatsApp(msg.audio.id); 
-                  } catch (e) { 
+                  mimeType = msg.audio?.mime_type || "audio/ogg";
+                  try {
+                    mediaUrl = await descargarMediaWhatsApp(msg.audio.id, mimeType);
+                  } catch (e) {
                     console.error("[Media Error Audio]:", e.message);
-                    textoMensaje = "[Error al descargar audio]"; 
+                    textoMensaje = "[Error al descargar audio]";
                   }
                 } else {
                   textoMensaje = `[Mensaje de tipo: ${msg.type}]`;
                 }
 
                 const mensajeId = msg.id || `msg_${Date.now()}`;
-                const timestampVal = msg.timestamp ? parseInt(msg.timestamp) * 1000 : Date.now();
-                
-                const nuevoMensaje = {
-                  id: mensajeId,
-                  from: msg.from,
-                  nombre: contactName,
-                  type: msg.type,
-                  text: textoMensaje,
-                  mediaUrl: mediaUrl,
-                  timestamp: new Date(timestampVal).toISOString()
-                };
 
+                // Insertar directamente en la tabla 'mensajes' de Supabase
                 try {
-                  const result = await Mensaje.updateOne(
-                    { id: mensajeId },
-                    { $setOnInsert: nuevoMensaje },
-                    { upsert: true }
-                  );
-                  if (result.upsertedCount > 0) {
-                    console.log(`💾 Nuevo mensaje ${mensajeId} guardado en MongoDB.`);
+                  const { error: sbErr } = await supabase.from("mensajes").insert([
+                    {
+                      remitente: `${contactName} (${msg.from})`,
+                      cuerpo: textoMensaje,
+                      URL_de_medios: mediaUrl,
+                      tipo_mime: mimeType,
+                    },
+                  ]);
+
+                  if (sbErr) {
+                    console.error("[Supabase Error]:", sbErr.message);
                   } else {
-                    console.log(`ℹ️ Mensaje ${mensajeId} ya existía en MongoDB.`);
+                    console.log(`⚡ Mensaje ${mensajeId} guardado con éxito en Supabase.`);
                   }
                 } catch (dbErr) {
-                  console.error("[MongoDB Error]:", dbErr.message);
-                }
-
-                try {
-                  await enviarMensajeFirebase(nuevoMensaje);
-                  console.log(`🔥 Mensaje ${mensajeId} guardado con éxito en Firebase DB_mensajes.`);
-                } catch (fbErr) {
-                  console.error("[Firebase Error Detallado]:", fbErr);
+                  console.error("[Supabase Insert Exception]:", dbErr.message);
                 }
               }
             }
@@ -333,5 +321,5 @@ app.post("/send-bulk", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`[Servidor Producción] API corriendo en puerto ${PORT}`);
+  console.log(`[Servidor Producción] API corriendo en puerto ${PORT} con Supabase`);
 });

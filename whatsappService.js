@@ -1,6 +1,10 @@
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
+
+// Inicializar cliente de Supabase
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 /**
  * Función interna genérica para realizar las peticiones a la API de WhatsApp Cloud.
@@ -49,16 +53,6 @@ function _limpiarNumero(numero) {
 // MÉTODOS PÚBLICOS DE ENVÍO
 // ==========================================
 
-/**
- * Envía una plantilla de WhatsApp.
- *
- * `componentesOParametros` acepta 3 formatos:
- *  1) Array de componentes ya armados por Meta: [{ type: 'header', parameters: [...] }, ...]
- *  2) Objeto { header, body } -> arma un componente 'header' y uno 'body', cada uno
- *     con su propio parámetro de texto. Usado por ej. en la plantilla "invitacion" o "alta".
- *  3) Array de strings sueltos -> se mandan todos como parámetros del 'body'
- *     (en orden, {{1}}, {{2}}, ...). Usado por ej. en la plantilla "mensaje_mensual".
- */
 async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [], templateName, languageCode = 'es_AR') {
   const cleanNumber = _limpiarNumero(numeroDestino);
   const nombrePlantilla = templateName;
@@ -68,12 +62,9 @@ async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [
     language: { code: languageCode }
   };
 
-  // 1️⃣ Ya vienen componentes estructurados de Meta (cada item con "type")
   if (Array.isArray(componentesOParametros) && componentesOParametros[0]?.type) {
     templatePayload.components = componentesOParametros;
-  }
-  // 2️⃣ Objeto { header, body } (ej: plantilla "invitacion" o "alta")
-  else if (
+  } else if (
     componentesOParametros &&
     typeof componentesOParametros === 'object' &&
     !Array.isArray(componentesOParametros) &&
@@ -81,7 +72,6 @@ async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [
   ) {
     const components = [];
 
-    // Header
     if (componentesOParametros.header !== undefined && String(componentesOParametros.header).trim() !== '') {
       components.push({
         type: 'header',
@@ -89,7 +79,6 @@ async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [
       });
     }
 
-    // Body (soporta string único o array con múltiples variables)
     if (componentesOParametros.body !== undefined) {
       let bodyParams = [];
 
@@ -110,9 +99,7 @@ async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [
     }
 
     templatePayload.components = components;
-  }
-  // 3️⃣ Array de parámetros sueltos (ej: plantilla "mensaje_mensual") u otros formatos legacy
-  else {
+  } else {
     let params = [];
 
     if (Array.isArray(componentesOParametros)) {
@@ -135,7 +122,6 @@ async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [
         }
       ];
     } else {
-      // Respaldo de seguridad si no llegó ningún parámetro
       templatePayload.components = [
         {
           type: 'body',
@@ -207,9 +193,12 @@ async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'docum
 }
 
 // ==========================================
-// MÉTODOS PÚBLICOS DE RECEPCIÓN / DESCARGA
+// MÉTODOS PÚBLICOS DE RECEPCIÓN / DESCARGA (ADAPTADO A SUPABASE)
 // ==========================================
 
+/**
+ * Descarga el archivo de medios de Meta y lo sube directamente al Bucket 'whatsapp-media' de Supabase Storage.
+ */
 async function descargarMediaWhatsApp(mediaId) {
   const token = process.env.META_ACCESS_TOKEN;
 
@@ -218,18 +207,22 @@ async function descargarMediaWhatsApp(mediaId) {
   }
 
   try {
+    // 1. Obtener la URL temporal de Meta
     const metaRes = await axios.get(`https://graph.facebook.com/v22.0/${mediaId}`, {
       headers: { Authorization: `Bearer ${token}` }
     });
 
     const downloadUrl = metaRes.data.url;
 
+    // 2. Descargar el contenido binario del archivo
     const mediaResponse = await axios.get(downloadUrl, {
       headers: { Authorization: `Bearer ${token}` },
       responseType: 'arraybuffer'
     });
 
-    const mimeType = mediaResponse.headers['content-type'] || '';
+    const mimeType = mediaResponse.headers['content-type'] || 'application/octet-stream';
+    
+    // 3. Determinar extensión del archivo
     let ext = 'bin';
     if (mimeType.includes('image/jpeg')) ext = 'jpg';
     else if (mimeType.includes('image/png')) ext = 'png';
@@ -239,19 +232,31 @@ async function descargarMediaWhatsApp(mediaId) {
     else if (mimeType.includes('audio/aac')) ext = 'aac';
     else if (mimeType.includes('application/pdf')) ext = 'pdf';
 
-    const uploadsFolder = path.join(__dirname, 'public', 'uploads');
-    if (!fs.existsSync(uploadsFolder)) {
-      fs.mkdirSync(uploadsFolder, { recursive: true });
+    const fileName = `${Date.now()}_${mediaId}.${ext}`;
+
+    // 4. Subir archivo a Supabase Storage
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('whatsapp-media')
+      .upload(fileName, mediaResponse.data, {
+        contentType: mimeType,
+        upsert: true
+      });
+
+    if (uploadError) {
+      console.error('❌ Error al subir archivo a Supabase Storage:', uploadError.message);
+      throw uploadError;
     }
 
-    const fileName = `${mediaId}.${ext}`;
-    const filePath = path.join(uploadsFolder, fileName);
+    // 5. Obtener la URL pública permanente
+    const { data: publicUrlData } = supabase.storage
+      .from('whatsapp-media')
+      .getPublicUrl(fileName);
 
-    fs.writeFileSync(filePath, mediaResponse.data);
+    console.log(`📁 Archivo subido con éxito a Supabase Storage: ${publicUrlData.publicUrl}`);
 
-    return `/uploads/${fileName}`;
+    return publicUrlData.publicUrl;
   } catch (error) {
-    console.error('❌ Error al descargar archivo multimedia de Meta:', error.message);
+    console.error('❌ Error al procesar archivo multimedia para Supabase:', error.message);
     throw error;
   }
 }
