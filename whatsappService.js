@@ -199,7 +199,7 @@ async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'docum
 /**
  * Descarga el archivo de medios de Meta y lo sube directamente al Bucket 'whatsapp-media' de Supabase Storage.
  */
-async function descargarMediaWhatsApp(mediaId) {
+async function descargarMediaWhatsApp(mediaId, mimeTypeEntrante = null) {
   const token = process.env.META_ACCESS_TOKEN;
 
   if (!token) {
@@ -220,25 +220,28 @@ async function descargarMediaWhatsApp(mediaId) {
       responseType: 'arraybuffer'
     });
 
-    const mimeType = mediaResponse.headers['content-type'] || 'application/octet-stream';
+    // 3. Determinar el MIME type exacto
+    const mimeType = mimeTypeEntrante || mediaResponse.headers['content-type'] || 'image/jpeg';
     
-    // 3. Determinar extensión del archivo
-    let ext = 'bin';
-    if (mimeType.includes('image/jpeg')) ext = 'jpg';
-    else if (mimeType.includes('image/png')) ext = 'png';
-    else if (mimeType.includes('image/webp')) ext = 'webp';
-    else if (mimeType.includes('audio/ogg')) ext = 'ogg';
-    else if (mimeType.includes('audio/mpeg')) ext = 'mp3';
-    else if (mimeType.includes('audio/aac')) ext = 'aac';
-    else if (mimeType.includes('application/pdf')) ext = 'pdf';
+    // 4. Determinar extensión del archivo
+    let ext = 'jpg';
+    const cleanMime = mimeType.toLowerCase();
+
+    if (cleanMime.includes('png')) ext = 'png';
+    else if (cleanMime.includes('webp')) ext = 'webp';
+    else if (cleanMime.includes('jpeg') || cleanMime.includes('jpg')) ext = 'jpg';
+    else if (cleanMime.includes('ogg')) ext = 'ogg';
+    else if (cleanMime.includes('mpeg') || cleanMime.includes('mp3')) ext = 'mp3';
+    else if (cleanMime.includes('aac')) ext = 'aac';
+    else if (cleanMime.includes('pdf')) ext = 'pdf';
 
     const fileName = `${Date.now()}_${mediaId}.${ext}`;
 
-    // 4. Subir archivo a Supabase Storage
+    // 5. Subir archivo a Supabase Storage
     const { data: uploadData, error: uploadError } = await supabase.storage
       .from('whatsapp-media')
       .upload(fileName, mediaResponse.data, {
-        contentType: mimeType,
+        contentType: mimeType.split(';')[0].trim(),
         upsert: true
       });
 
@@ -247,7 +250,7 @@ async function descargarMediaWhatsApp(mediaId) {
       throw uploadError;
     }
 
-    // 5. Obtener la URL pública permanente
+    // 6. Obtener la URL pública permanente
     const { data: publicUrlData } = supabase.storage
       .from('whatsapp-media')
       .getPublicUrl(fileName);
