@@ -7,11 +7,16 @@ const {
 } = require("../whatsappService");
 
 const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws'); // 👈 Se importa WebSocket
 
 // Conexión a Supabase para el guardado automático
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+
+const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: { persistSession: false },
+  realtime: { transport: WebSocket } // 👈 Se pasa la opción de transporte
+});
 
 // MÉTODOS DE ENVÍO (SALIENTES)
 
