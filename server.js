@@ -8,7 +8,7 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const { createClient } = require("@supabase/supabase-js");
-
+const WebSocket = require('ws');
 
 // Módulos modularizados
 const { descargarMediaWhatsApp } = require("./whatsappService");
@@ -28,7 +28,14 @@ if (!supabaseUrl || !supabaseKey) {
   process.exit(1);
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: {
+    persistSession: false,
+  },
+  realtime: {
+    transport: WebSocket, // 👈 Se asigna la implementación de WebSocket
+  },
+});
 console.log("✅ Conectado exitosamente a Supabase");
 
 // MIDDLEWARES GENERALES
