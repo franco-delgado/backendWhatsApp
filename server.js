@@ -72,12 +72,20 @@ app.get("/api/mensajes", async (req, res) => {
   try {
     const { data: mensajes, error } = await supabase
       .from("messages")
-      .select("*")
-      .order("created_at", { ascending: false });
+      .select("*");
 
-    if (error) throw error;
+    if (error) {
+      console.error("❌ ERROR DIRECTO DE SUPABASE:", error);
+      // Devuelve la causa real a la respuesta HTTP
+      return res.status(500).json({ 
+        success: false, 
+        error: error.message, 
+        details: error.details, 
+        hint: error.hint,
+        code: error.code 
+      });
+    }
 
-    // Mapeamos los campos al formato que espera el frontend
     const mensajesFormateados = (mensajes || []).map(m => ({
       id: m.id,
       remitente: m.sender,
@@ -87,10 +95,10 @@ app.get("/api/mensajes", async (req, res) => {
       created_at: m.created_at
     }));
 
-    res.json({ success: true, total: mensajesFormateados.length, data: mensajesFormateados });
-  } catch (error) {
-    console.error("[Servidor] Error al consultar mensajes de Supabase:", error.message);
-    res.status(500).json({ success: false, error: "Error al consultar mensajes." });
+    return res.json({ success: true, total: mensajesFormateados.length, data: mensajesFormateados });
+  } catch (err) {
+    console.error("❌ EXCEPCIÓN DE SERVIDOR:", err);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
