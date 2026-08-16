@@ -1,10 +1,15 @@
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws'); // 👈 Se importa ANTES de inicializar Supabase
 
-// Inicializar cliente de Supabase
+// Inicializar cliente de Supabase con WebSocket habilitado
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+
+const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: { persistSession: false },
+  realtime: { transport: WebSocket } // 👈 Se pasa el transporte de WebSocket a Supabase Realtime
+});
 
 /**
  * Función interna genérica para realizar las peticiones a la API de WhatsApp Cloud.
@@ -40,9 +45,7 @@ async function _enviarPeticionMeta(data) {
   }
 }
 
-/**
- * Sanitiza y valida el número de teléfono.
- */
+ // Sanitiza y valida el número de teléfono.
 function _limpiarNumero(numero) {
   const cleanNumber = String(numero).replace(/\D/g, '');
   if (!cleanNumber) throw new Error('El número de destino no es válido.');
@@ -196,9 +199,7 @@ async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'docum
 // MÉTODOS PÚBLICOS DE RECEPCIÓN / DESCARGA (ADAPTADO A SUPABASE)
 // ==========================================
 
-/**
- * Descarga el archivo de medios de Meta y lo sube directamente al Bucket 'whatsapp-media' de Supabase Storage.
- */
+ // Descarga el archivo de medios de Meta y lo sube directamente al Bucket 'whatsapp-media' de Supabase Storage.
 async function descargarMediaWhatsApp(mediaId, mimeTypeEntrante = null) {
   const token = process.env.META_ACCESS_TOKEN;
 
