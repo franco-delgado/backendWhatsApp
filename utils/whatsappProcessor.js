@@ -7,7 +7,7 @@ const {
 } = require("../whatsappService");
 
 const { createClient } = require('@supabase/supabase-js');
-const WebSocket = require('ws'); // 👈 Se importa WebSocket
+const WebSocket = require('ws');
 
 // Conexión a Supabase para el guardado automático
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -15,7 +15,7 @@ const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const supabase = createClient(supabaseUrl, supabaseKey, {
   auth: { persistSession: false },
-  realtime: { transport: WebSocket } // 👈 Se pasa la opción de transporte
+  realtime: { transport: WebSocket }
 });
 
 // MÉTODOS DE ENVÍO (SALIENTES)
@@ -79,15 +79,15 @@ async function procesarMensajeEntrante(message) {
       urlMedio = await descargarMediaWhatsApp(message.document.id, tipoMime);
     }
 
-    // Inserción automática en la tabla 'mensajes' de Supabase
+    // Inserción en la tabla 'messages' de Supabase
     const { data, error } = await supabase
-      .from('mensajes')
+      .from('messages')
       .insert([
         {
-          remitente: message.from,
-          cuerpo: textoCuerpo,
-          URL_de_medios: urlMedio,
-          tipo_mime: tipoMime
+          sender: message.from,
+          body: textoCuerpo,
+          media_url: urlMedio,
+          mime_type: tipoMime
         }
       ]);
 

@@ -21,7 +21,7 @@ const PORT = process.env.PORT || 3000;
 // CONEXIÓN A SUPABASE
 // =========================================================================
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Usa la Service Role Key para evitar bloqueos por RLS
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseUrl || !supabaseKey) {
   console.error("❌ Faltan las variables SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el archivo .env");
@@ -29,12 +29,8 @@ if (!supabaseUrl || !supabaseKey) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey, {
-  auth: {
-    persistSession: false,
-  },
-  realtime: {
-    transport: WebSocket, // 👈 Se asigna la implementación de WebSocket
-  },
+  auth: { persistSession: false },
+  realtime: { transport: WebSocket }
 });
 console.log("✅ Conectado exitosamente a Supabase");
 
@@ -75,13 +71,23 @@ app.get("/status", (req, res) => {
 app.get("/api/mensajes", async (req, res) => {
   try {
     const { data: mensajes, error } = await supabase
-      .from("mensajes")
+      .from("messages")
       .select("*")
       .order("created_at", { ascending: false });
 
     if (error) throw error;
 
-    res.json({ success: true, total: mensajes.length, data: mensajes });
+    // Mapeamos los campos al formato que espera el frontend
+    const mensajesFormateados = (mensajes || []).map(m => ({
+      id: m.id,
+      remitente: m.sender,
+      cuerpo: m.body,
+      URL_de_medios: m.media_url,
+      tipo_mime: m.mime_type,
+      created_at: m.created_at
+    }));
+
+    res.json({ success: true, total: mensajesFormateados.length, data: mensajesFormateados });
   } catch (error) {
     console.error("[Servidor] Error al consultar mensajes de Supabase:", error.message);
     res.status(500).json({ success: false, error: "Error al consultar mensajes." });
@@ -94,11 +100,10 @@ app.delete("/api/mensajes/:id", async (req, res) => {
     const { id } = req.params;
     console.log(`[DELETE] Solicitud para eliminar mensaje ID: ${id}`);
 
-    // Eliminar por UUID de Supabase o por identificador de la columna 'id'
     const { data, error } = await supabase
-      .from("mensajes")
+      .from("messages")
       .delete()
-      .or(`id.eq.${id},identificacion.eq.${id}`)
+      .eq("id", id)
       .select();
 
     if (error) throw error;
@@ -119,11 +124,10 @@ app.delete("/api/mensajes/:id", async (req, res) => {
 // 3. Vaciar todo el historial de mensajes
 app.delete("/api/mensajes", async (req, res) => {
   try {
-    // Borrado general filtrando por registros cuyo ID exista
     const { error } = await supabase
-      .from("mensajes")
+      .from("messages")
       .delete()
-      .neq("remitente", "___DUMMY_FILTER___");
+      .neq("sender", "___DUMMY_FILTER___");
 
     if (error) throw error;
 
@@ -157,13 +161,13 @@ app.post("/api/mensajes/responder", async (req, res) => {
 
     const respuestaId = result?.messages?.[0]?.id || `out_${Date.now()}`;
 
-    // Guardar respuesta en Supabase
-    const { error: sbErr } = await supabase.from("mensajes").insert([
+    // Guardar respuesta en Supabase (usando la tabla 'messages' y columnas reales)
+    const { error: sbErr } = await supabase.from("messages").insert([
       {
-        remitente: `Soporte (${destinatario})`,
-        cuerpo: mensaje,
-        URL_de_medios: null,
-        tipo_mime: "text/plain",
+        sender: `Soporte (${destinatario})`,
+        body: mensaje,
+        media_url: null,
+        mime_type: "text/plain",
       },
     ]);
 
@@ -288,14 +292,14 @@ app.post("/webhook", async (req, res) => {
 
                 const mensajeId = msg.id || `msg_${Date.now()}`;
 
-                // Insertar directamente en la tabla 'mensajes' de Supabase
+                // Insertar en la tabla 'messages'
                 try {
-                  const { error: sbErr } = await supabase.from("mensajes").insert([
+                  const { error: sbErr } = await supabase.from("messages").insert([
                     {
-                      remitente: `${contactName} (${msg.from})`,
-                      cuerpo: textoMensaje,
-                      URL_de_medios: mediaUrl,
-                      tipo_mime: mimeType,
+                      sender: `${contactName} (${msg.from})`,
+                      body: textoMensaje,
+                      media_url: mediaUrl,
+                      mime_type: mimeType,
                     },
                   ]);
 
