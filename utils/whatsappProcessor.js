@@ -2,8 +2,18 @@ const {
   enviarPlantillaWhatsApp, 
   enviarTextoLibreWhatsApp, 
   enviarImagenWhatsApp, 
-  enviarDocumentoWhatsApp 
+  enviarDocumentoWhatsApp,
+  descargarMediaWhatsApp
 } = require("../whatsappService");
+
+const { createClient } = require('@supabase/supabase-js');
+
+// Conexión a Supabase para el guardado automático
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// MÉTODOS DE ENVÍO (SALIENTES)
 
 async function procesarEnvio(payload) {
   const number = payload.number || payload.to || payload.phone;
@@ -39,4 +49,54 @@ async function procesarEnvio(payload) {
   }
 }
 
-module.exports = { procesarEnvio };
+// MÉTODOS DE RECEPCIÓN (ENTRANTES - AUTOMÁTICO)
+
+async function procesarMensajeEntrante(message) {
+  try {
+    let urlMedio = null;
+    let tipoMime = null;
+    let textoCuerpo = '';
+
+    // Manejo de tipos de mensaje
+    if (message.type === 'text') {
+      textoCuerpo = message.text?.body || '';
+    } else if (message.type === 'image') {
+      textoCuerpo = message.image?.caption || '';
+      tipoMime = message.image?.mime_type;
+      urlMedio = await descargarMediaWhatsApp(message.image.id, tipoMime);
+    } else if (message.type === 'audio' || message.type === 'voice') {
+      const audioData = message.audio || message.voice;
+      tipoMime = audioData?.mime_type;
+      urlMedio = await descargarMediaWhatsApp(audioData.id, tipoMime);
+    } else if (message.type === 'document') {
+      textoCuerpo = message.document?.caption || '';
+      tipoMime = message.document?.mime_type;
+      urlMedio = await descargarMediaWhatsApp(message.document.id, tipoMime);
+    }
+
+    // Inserción automática en la tabla 'mensajes' de Supabase
+    const { data, error } = await supabase
+      .from('mensajes')
+      .insert([
+        {
+          remitente: message.from,
+          cuerpo: textoCuerpo,
+          URL_de_medios: urlMedio,
+          tipo_mime: tipoMime
+        }
+      ]);
+
+    if (error) {
+      console.error('❌ Error al guardar en Supabase:', error.message);
+    } else {
+      console.log('✅ Mensaje guardado correctamente en Supabase.');
+    }
+  } catch (error) {
+    console.error('❌ Error en procesarMensajeEntrante:', error.message);
+  }
+}
+
+module.exports = { 
+  procesarEnvio,
+  procesarMensajeEntrante
+};

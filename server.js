@@ -9,6 +9,7 @@ const cors = require("cors");
 const path = require("path");
 const { createClient } = require("@supabase/supabase-js");
 
+
 // Módulos modularizados
 const { descargarMediaWhatsApp } = require("./whatsappService");
 const { procesarEnvio } = require("./utils/whatsappProcessor");
@@ -217,6 +218,7 @@ app.post("/webhook", async (req, res) => {
                 let mediaUrl = null;
                 let mimeType = "text/plain";
 
+                // TEXTO O BOTONES
                 if (msg.type === "text" && msg.text?.body) {
                   textoMensaje = msg.text.body;
                   mimeType = "text/plain";
@@ -227,23 +229,52 @@ app.post("/webhook", async (req, res) => {
                     msg.interactive?.button_reply?.title ||
                     msg.interactive?.list_reply?.title ||
                     "[Respuesta Interactiva]";
-                } else if (msg.type === "image" && msg.image?.id) {
-                  textoMensaje = msg.image?.caption || "";
-                  mimeType = msg.image?.mime_type || "image/jpeg";
+
+                // IMÁGENES / STICKERS
+                } else if ((msg.type === "image" && msg.image?.id) || (msg.type === "sticker" && msg.sticker?.id)) {
+                  const mediaData = msg.image || msg.sticker;
+                  textoMensaje = mediaData?.caption || "";
+                  mimeType = mediaData?.mime_type || "image/jpeg";
                   try {
-                    mediaUrl = await descargarMediaWhatsApp(msg.image.id, mimeType);
+                    mediaUrl = await descargarMediaWhatsApp(mediaData.id, mimeType);
                   } catch (e) {
                     console.error("[Media Error Imagen]:", e.message);
                     textoMensaje = "[Error al descargar imagen]";
                   }
-                } else if (msg.type === "audio" && msg.audio?.id) {
-                  mimeType = msg.audio?.mime_type || "audio/ogg";
+
+                // AUDIOS Y NOTAS DE VOZ
+                } else if ((msg.type === "audio" && msg.audio?.id) || (msg.type === "voice" && msg.voice?.id)) {
+                  const mediaData = msg.audio || msg.voice;
+                  mimeType = mediaData?.mime_type || "audio/ogg";
                   try {
-                    mediaUrl = await descargarMediaWhatsApp(msg.audio.id, mimeType);
+                    mediaUrl = await descargarMediaWhatsApp(mediaData.id, mimeType);
                   } catch (e) {
                     console.error("[Media Error Audio]:", e.message);
                     textoMensaje = "[Error al descargar audio]";
                   }
+
+                // DOCUMENTOS
+                } else if (msg.type === "document" && msg.document?.id) {
+                  textoMensaje = msg.document?.caption || msg.document?.filename || "";
+                  mimeType = msg.document?.mime_type || "application/pdf";
+                  try {
+                    mediaUrl = await descargarMediaWhatsApp(msg.document.id, mimeType);
+                  } catch (e) {
+                    console.error("[Media Error Documento]:", e.message);
+                    textoMensaje = "[Error al descargar documento]";
+                  }
+
+                // VIDEOS
+                } else if (msg.type === "video" && msg.video?.id) {
+                  textoMensaje = msg.video?.caption || "";
+                  mimeType = msg.video?.mime_type || "video/mp4";
+                  try {
+                    mediaUrl = await descargarMediaWhatsApp(msg.video.id, mimeType);
+                  } catch (e) {
+                    console.error("[Media Error Video]:", e.message);
+                    textoMensaje = "[Error al descargar video]";
+                  }
+
                 } else {
                   textoMensaje = `[Mensaje de tipo: ${msg.type}]`;
                 }
