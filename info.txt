@@ -1,0 +1,11 @@
+Mantener el servidor corriendo:
+npm install -g pm2
+pm2 start server.js --name whatsapp-connector
+pm2 save
+pm2 startup   # seguí las instrucciones que imprime para que arranque solo al bootear el servidor
+
+las fotos ayuda estan en el note 11
+
+Este link es de la conversacion de este codigo: 
+
+https://claude.ai/chat/c4433e91-4b98-4a36-a1e0-2e568e859379
