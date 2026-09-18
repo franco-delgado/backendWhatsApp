@@ -19,6 +19,30 @@ Tus responsabilidades:
 3. Mantén un tono cordial, usando emojis ocasionales pero sin saturar.
 `;
 
+// Reintenta ante errores transitorios de Gemini (503 "sobrecargado", 429 "rate limit").
+// Otros errores (API key inválida, etc.) no tiene sentido reintentarlos: se cortan al toque.
+async function llamarConReintentos(payload, intentos = 3) {
+  for (let intento = 1; intento <= intentos; intento++) {
+    try {
+      return await ai.models.generateContent(payload);
+    } catch (error) {
+      const esTransitorio = /503|429|UNAVAILABLE|RESOURCE_EXHAUSTED/i.test(error.message || "");
+      const quedanIntentos = intento < intentos;
+
+      if (esTransitorio && quedanIntentos) {
+        const esperaMs = 1000 * intento; // 1s, 2s, 3s...
+        console.warn(
+          `[IA Framework] Gemini sobrecargado (intento ${intento}/${intentos}). Reintentando en ${esperaMs}ms.`
+        );
+        await new Promise((resolve) => setTimeout(resolve, esperaMs));
+        continue;
+      }
+
+      throw error;
+    }
+  }
+}
+
 /**
  * Framework para interactuar con el modelo de IA.
  * @param {string} mensajeActual - El texto del mensaje que acaba de enviar el cliente.
@@ -50,7 +74,7 @@ async function responderConIA(mensajeActual, historialPrevio = []) {
       parts: [{ text: mensajeActual }],
     });
 
-    const response = await ai.models.generateContent({
+    const response = await llamarConReintentos({
       model: "gemini-3.6-flash",
       contents: contents,
       config: {
