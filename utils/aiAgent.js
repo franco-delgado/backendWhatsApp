@@ -107,7 +107,15 @@ async function responderConIA(mensajeActual, historialPrevio = []) {
       config: {
         systemInstruction: SYSTEM_INSTRUCTIONS,
         temperature: 0.7,
-        maxOutputTokens: 500,
+        maxOutputTokens: 1024,
+        // Sin esto, el modelo "piensa" internamente antes de responder y esos
+        // tokens de pensamiento se descuentan del mismo maxOutputTokens, así
+        // que a veces no quedaba presupuesto para el texto real y la
+        // respuesta se cortaba a mitad de frase. Para un FAQ acotado como
+        // este no hace falta razonamiento extra.
+        thinkingConfig: {
+          thinkingBudget: 0,
+        },
       },
     });
 
