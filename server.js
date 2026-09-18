@@ -4,8 +4,14 @@ const express = require("express");
 const cors = require("cors");
 
 const { supabase } = require("./supabaseClient");
-const { descargarMediaWhatsApp } = require("./whatsappService");
+const { descargarMediaWhatsApp, enviarTextoLibreWhatsApp } = require("./whatsappService");
 const { procesarEnvio } = require("./utils/whatsappProcessor");
+const { responderConIA } = require("./utils/aiAgent");
+
+// Interruptor general del agente de IA. Poné AI_AUTORESPONDER=false en
+// Render (Environment) si alguna vez necesitás apagarlo sin tocar código.
+const AI_AUTORESPONDER_ACTIVO =
+  String(process.env.AI_AUTORESPONDER || "true").toLowerCase() !== "false";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -205,6 +211,36 @@ app.delete("/api/mensajes", async (req, res) => {
   }
 });
 
+// Usada tanto por el endpoint manual como por el agente de IA: manda el
+// mensaje por WhatsApp y lo deja guardado en Supabase como "Soporte (numero)".
+async function enviarRespuestaSoporte(numeroLimpio, texto, contextMessageId = null) {
+  const result = await procesarEnvio({
+    to: numeroLimpio,
+    type: "text",
+    text: texto,
+    contextMessageId,
+  });
+
+  const respuestaId = result?.messages?.[0]?.id || `out_${Date.now()}`;
+
+  const { error: sbErr } = await supabase.from("messages").insert([
+    {
+      sender: `Soporte (${numeroLimpio})`,
+      body: texto,
+      media_url: null,
+      mime_type: "text/plain",
+    },
+  ]);
+
+  if (sbErr) {
+    console.error("[Supabase Outbound Error]:", sbErr.message);
+  } else {
+    console.log(`⚡ Respuesta ${respuestaId} guardada en Supabase.`);
+  }
+
+  return result;
+}
+
 app.post("/api/mensajes/responder", async (req, res) => {
   try {
     const { to, number, messageText, text, contextMessageId } = req.body || {};
@@ -219,30 +255,8 @@ app.post("/api/mensajes/responder", async (req, res) => {
       });
     }
 
-    const result = await procesarEnvio({
-      to: destinatario,
-      type: "text",
-      text: mensaje,
-      contextMessageId: contextMessageId || null,
-    });
-
-    const respuestaId = result?.messages?.[0]?.id || `out_${Date.now()}`;
     const numeroLimpio = String(destinatario).replace(/\D/g, "");
-
-    const { error: sbErr } = await supabase.from("messages").insert([
-      {
-        sender: `Soporte (${numeroLimpio})`,
-        body: mensaje,
-        media_url: null,
-        mime_type: "text/plain",
-      },
-    ]);
-
-    if (sbErr) {
-      console.error("[Supabase Outbound Error]:", sbErr.message);
-    } else {
-      console.log(`⚡ Respuesta ${respuestaId} guardada en Supabase.`);
-    }
+    const result = await enviarRespuestaSoporte(numeroLimpio, mensaje, contextMessageId || null);
 
     res.json({ success: true, message: "Respuesta enviada con éxito.", data: result });
   } catch (err) {
@@ -336,6 +350,53 @@ async function procesarMensajeEntrante(msg, contactName) {
   } catch (e) {
     console.error("[Supabase Excepción al insertar]:", e.message);
   }
+
+  // Agente de IA: solo para mensajes de texto con contenido real. Los
+  // audios/imágenes se guardan igual arriba, pero no disparan respuesta
+  // automática (Gemini no "ve" el archivo en este flujo).
+  if (AI_AUTORESPONDER_ACTIVO && msg.type === "text" && textoMensaje.trim()) {
+    try {
+      const historial = await obtenerHistorialParaIA(numeroLimpio);
+      const respuestaIA = await responderConIA(textoMensaje, historial);
+
+      if (respuestaIA && respuestaIA.trim()) {
+        await enviarRespuestaSoporte(numeroLimpio, respuestaIA.trim());
+        console.log(`🤖 Respuesta de IA enviada a ${numeroLimpio}.`);
+      } else {
+        console.warn(`🤖 La IA no devolvió texto para ${numeroLimpio}, no se envía nada.`);
+      }
+    } catch (e) {
+      console.error("[Agente IA] Error generando/enviando respuesta:", e.message);
+    }
+  }
+}
+
+// Trae los últimos mensajes de esa conversación (por número) y los deja en
+// el formato { esCliente, texto } que espera utils/aiAgent.js.
+// Se llama DESPUÉS de guardar el mensaje entrante, así que el más reciente
+// del resultado ES ese mismo mensaje: se descarta acá porque aiAgent.js ya
+// lo recibe aparte como "mensajeActual" (si no, quedaría duplicado).
+async function obtenerHistorialParaIA(numeroLimpio, limite = 10) {
+  const { data, error } = await supabase
+    .from("messages")
+    .select("sender, body, created_at")
+    .ilike("sender", `%(${numeroLimpio})`)
+    .order("created_at", { ascending: false })
+    .limit(limite + 1);
+
+  if (error) {
+    console.error("[Agente IA] Error trayendo historial:", error.message);
+    return [];
+  }
+
+  return (data || [])
+    .reverse()
+    .slice(0, -1) // saca el mensaje actual, que ya se agrega por separado
+    .filter((m) => (m.body || "").trim() !== "")
+    .map((m) => ({
+      esCliente: !String(m.sender || "").startsWith("Soporte ("),
+      texto: m.body,
+    }));
 }
 
 // Deduplicación en memoria: Meta reintenta el mismo webhook varias veces.

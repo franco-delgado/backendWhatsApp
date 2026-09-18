@@ -34,7 +34,7 @@ async function responderConIA(mensajeActual, historialPrevio = []) {
 
     // Formatear historial si se proporciona (útil para conversaciones continuas)
     const contents = [];
-    
+
     if (Array.isArray(historialPrevio) && historialPrevio.length > 0) {
       historialPrevio.forEach((msg) => {
         contents.push({
