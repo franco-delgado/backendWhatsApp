@@ -7,6 +7,7 @@ const { supabase } = require("./supabaseClient");
 const { descargarMediaWhatsApp, enviarTextoLibreWhatsApp } = require("./whatsappService");
 const { procesarEnvio } = require("./utils/whatsappProcessor");
 const { responderConIA } = require("./utils/aiAgent");
+const push = require("./utils/pushService");
 
 // Interruptor general del agente de IA. Poné AI_AUTORESPONDER=false en
 // Render (Environment) si alguna vez necesitás apagarlo sin tocar código.
@@ -75,6 +76,8 @@ app.get("/api/diag", async (req, res) => {
       META_PHONE_NUMBER_ID: Boolean(process.env.META_PHONE_NUMBER_ID),
       META_ACCESS_TOKEN: Boolean(process.env.META_ACCESS_TOKEN),
       META_WEBHOOK_VERIFY_TOKEN: Boolean(process.env.META_WEBHOOK_VERIFY_TOKEN),
+      VAPID_PUBLIC_KEY: Boolean(process.env.VAPID_PUBLIC_KEY),
+      VAPID_PRIVATE_KEY: Boolean(process.env.VAPID_PRIVATE_KEY),
     },
     supabase: { lectura: null, escritura: null },
     ultimoWebhook: ultimoWebhookRecibido,
@@ -266,6 +269,62 @@ app.post("/api/mensajes/responder", async (req, res) => {
 });
 
 // =========================================================================
+// NOTIFICACIONES PUSH
+// =========================================================================
+app.get("/api/push/public-key", (req, res) => {
+  if (!push.pushActivo()) {
+    return res
+      .status(503)
+      .json({ success: false, error: "Push no configurado en el servidor (faltan claves VAPID)." });
+  }
+  res.json({ success: true, publicKey: push.VAPID_PUBLIC_KEY });
+});
+
+app.post("/api/push/subscribe", async (req, res) => {
+  try {
+    await push.guardarSuscripcion(req.body);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[Push] subscribe:", err.message);
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/api/push/unsubscribe", async (req, res) => {
+  try {
+    await push.eliminarSuscripcion(req.body?.endpoint);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[Push] unsubscribe:", err.message);
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// Manda una notificación de prueba SOLO al dispositivo que la pide.
+app.post("/api/push/test", async (req, res) => {
+  try {
+    const { endpoint } = req.body || {};
+    if (!endpoint) {
+      return res.status(400).json({ success: false, error: "Falta 'endpoint'." });
+    }
+    const resultado = await push.enviarPush(
+      {
+        title: "Notificaciones activadas ✅",
+        body: "Así vas a ver los mensajes nuevos, aunque la app esté cerrada.",
+        tag: "prueba-push",
+        url: "/",
+        siempre: true, // se muestra aunque la app esté abierta
+      },
+      endpoint
+    );
+    res.json({ success: true, ...resultado });
+  } catch (err) {
+    console.error("[Push] test:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// =========================================================================
 // WEBHOOK DE META (WHATSAPP CLOUD API)
 // =========================================================================
 
@@ -350,6 +409,12 @@ async function procesarMensajeEntrante(msg, contactName) {
   } catch (e) {
     console.error("[Supabase Excepción al insertar]:", e.message);
   }
+
+  // Notificación push al celular/PC. Sin await a propósito: no debe demorar
+  // la respuesta automática de la IA ni el 200 hacia Meta.
+  push
+    .notificarMensajeNuevo({ msg, contactName, numero: numeroLimpio, texto: textoMensaje })
+    .catch((e) => console.error("[Push] Error notificando:", e.message));
 
   // Agente de IA: solo para mensajes de texto con contenido real. Los
   // audios/imágenes se guardan igual arriba, pero no disparan respuesta
