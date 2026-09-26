@@ -502,8 +502,26 @@ app.post("/webhook", (req, res) => {
         if (Array.isArray(value?.statuses)) {
           for (const status of value.statuses) {
             console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status}`);
-            if (status.errors?.length) {
+
+            const primerError = status.errors?.[0];
+            if (primerError) {
               console.error("[Status Error]:", JSON.stringify(status.errors));
+            }
+
+            // Actualiza message_log con el estado real (sent/delivered/read/failed)
+            // y, si vino, el código y detalle del error de Meta.
+            const { error: sbErr } = await supabase
+              .from("message_log")
+              .update({
+                status: status.status,
+                error_code: primerError?.code ? String(primerError.code) : null,
+                error_detalle: primerError?.title || primerError?.message || null,
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", status.id);
+
+            if (sbErr) {
+              console.error("[message_log] Error al actualizar status:", sbErr.message);
             }
           }
         }
@@ -541,6 +559,32 @@ function coincideNumero(a, b) {
   if (!da || !db) return false;
   return da.slice(-8) === db.slice(-8);
 }
+
+// Consulta el estado real de mensajes enviados. Filtros opcionales por
+// query string: ?numero=549..., ?template=invitacion2109, ?status=failed
+app.get("/api/message-log", async (req, res) => {
+  try {
+    const { numero, template, status, limit = 50 } = req.query;
+
+    let query = supabase
+      .from("message_log")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(Number(limit));
+
+    if (numero) query = query.eq("numero_destino", String(numero).replace(/\D/g, ""));
+    if (template) query = query.eq("template_name", template);
+    if (status) query = query.eq("status", status);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    res.json({ success: true, count: data.length, data });
+  } catch (error) {
+    console.error("[Servidor] Error en /api/message-log:", error.message);
+    res.status(500).json({ success: false, error: "Error al consultar message_log." });
+  }
+});
 
 // =========================================================================
 // ENDPOINTS DE ENVÍO MASIVO / INDIVIDUAL

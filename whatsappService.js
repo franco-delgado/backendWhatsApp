@@ -1,10 +1,37 @@
 const axios = require('axios');
 const { supabase } = require('./supabaseClient'); // cliente Supabase compartido (antes se creaba uno por archivo)
 
+// Guarda en message_log el wamid que devuelve Meta al aceptar el envío.
+// Nunca debe tumbar el flujo de envío: cualquier error acá solo se loggea.
+async function _registrarEnvio({ wamid, numeroDestino, tipo, templateName, payload }) {
+  if (!wamid) return;
+  try {
+    const { error } = await supabase.from('message_log').insert([
+      {
+        id: wamid,
+        numero_destino: numeroDestino,
+        tipo,
+        template_name: templateName || null,
+        status: 'sent',
+        payload_enviado: payload,
+      },
+    ]);
+    if (error) {
+      console.error('[message_log] Error al registrar envío:', error.message);
+    } else {
+      console.log(`📝 [message_log] Envío registrado: ${wamid}`);
+    }
+  } catch (e) {
+    console.error('[message_log] Excepción al registrar envío:', e.message);
+  }
+}
+
 /**
  * Función interna genérica para realizar las peticiones a la API de WhatsApp Cloud.
+ * meta: { numeroDestino, tipo, templateName } — datos extra solo para poder
+ * loguear el envío en message_log una vez que Meta confirma el wamid.
  */
-async function _enviarPeticionMeta(data) {
+async function _enviarPeticionMeta(data, meta = {}) {
   const phoneNumberId = process.env.META_PHONE_NUMBER_ID;
   const token = process.env.META_ACCESS_TOKEN;
 
@@ -23,6 +50,17 @@ async function _enviarPeticionMeta(data) {
         'Content-Type': 'application/json'
       }
     });
+
+    const wamid = response.data?.messages?.[0]?.id;
+    // No usamos await a propósito: no debe demorar la respuesta al llamador.
+    _registrarEnvio({
+      wamid,
+      numeroDestino: meta.numeroDestino,
+      tipo: meta.tipo,
+      templateName: meta.templateName,
+      payload: data,
+    });
+
     return response.data;
   } catch (error) {
     if (error.response) {
@@ -127,7 +165,7 @@ async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [
     to: cleanNumber,
     type: 'template',
     template: templatePayload
-  });
+  }, { numeroDestino: cleanNumber, tipo: 'template', templateName: nombrePlantilla });
 }
 
 async function enviarTextoLibreWhatsApp(numeroDestino, texto, contextMessageId = null) {
@@ -147,7 +185,7 @@ async function enviarTextoLibreWhatsApp(numeroDestino, texto, contextMessageId =
     };
   }
 
-  return await _enviarPeticionMeta(payload);
+  return await _enviarPeticionMeta(payload, { numeroDestino: cleanNumber, tipo: 'text' });
 }
 
 async function enviarImagenWhatsApp(numeroDestino, linkUrl, caption = '') {
@@ -162,7 +200,7 @@ async function enviarImagenWhatsApp(numeroDestino, linkUrl, caption = '') {
       link: linkUrl,
       ...(caption && { caption })
     }
-  });
+  }, { numeroDestino: cleanNumber, tipo: 'image' });
 }
 
 async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'documento.pdf', caption = '') {
@@ -178,7 +216,7 @@ async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'docum
       filename: filename,
       ...(caption && { caption })
     }
-  });
+  }, { numeroDestino: cleanNumber, tipo: 'document' });
 }
 
 // ==========================================
