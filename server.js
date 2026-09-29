@@ -9,6 +9,9 @@ const { procesarEnvio } = require("./utils/whatsappProcessor");
 const { responderConIA } = require("./utils/aiAgent");
 const push = require("./utils/pushService");
 
+const { pausarIA, iaPausadaHasta, reanudarIA, listarPausasActivas, MINUTOS_POR_DEFECTO } = require("./utils/pausaIA");
+
+
 // Interruptor general del agente de IA. Poné AI_AUTORESPONDER=false en
 // Render (Environment) si alguna vez necesitás apagarlo sin tocar código.
 const AI_AUTORESPONDER_ACTIVO =
@@ -261,10 +264,89 @@ app.post("/api/mensajes/responder", async (req, res) => {
     const numeroLimpio = String(destinatario).replace(/\D/g, "");
     const result = await enviarRespuestaSoporte(numeroLimpio, mensaje, contextMessageId || null);
 
-    res.json({ success: true, message: "Respuesta enviada con éxito.", data: result });
+    // Contestaste vos a mano: el bot se calla un rato para no pisar la charla.
+    // Cada respuesta manual renueva el plazo. Se pausa DESPUÉS de enviar, así
+    // si el envío falla (ej. error 131047) el bot no queda apagado en vano.
+    const pausadaHasta = await pausarIA(numeroLimpio);
+
+    res.json({
+      success: true,
+      message: "Respuesta enviada con éxito.",
+      data: result,
+      iaPausadaHasta: pausadaHasta ? pausadaHasta.toISOString() : null,
+      iaPausaMinutos: MINUTOS_POR_DEFECTO,
+    });
   } catch (err) {
     console.error("[Servidor] Error en /api/mensajes/responder:", err.message);
     res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// Estado de las pausas vigentes (lo consulta el frontend para mostrar "🤖 pausado").
+app.get("/api/ia/pausas", async (req, res) => {
+  const pausas = await listarPausasActivas();
+  res.json({ success: true, minutosPorDefecto: MINUTOS_POR_DEFECTO, data: pausas });
+});
+
+// Reactivar el bot antes de que se cumpla la hora.
+app.delete("/api/ia/pausas/:numero", async (req, res) => {
+  await reanudarIA(req.params.numero);
+  res.json({ success: true, message: "Bot reactivado para este contacto." });
+});
+
+// =========================================================================
+// NOTIFICACIONES PUSH
+// =========================================================================
+app.get("/api/push/public-key", (req, res) => {
+  if (!push.pushActivo()) {
+    return res
+      .status(503)
+      .json({ success: false, error: "Push no configurado en el servidor (faltan claves VAPID)." });
+  }
+  res.json({ success: true, publicKey: push.VAPID_PUBLIC_KEY });
+});
+
+app.post("/api/push/subscribe", async (req, res) => {
+  try {
+    await push.guardarSuscripcion(req.body);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[Push] subscribe:", err.message);
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/api/push/unsubscribe", async (req, res) => {
+  try {
+    await push.eliminarSuscripcion(req.body?.endpoint);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[Push] unsubscribe:", err.message);
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// Manda una notificación de prueba SOLO al dispositivo que la pide.
+app.post("/api/push/test", async (req, res) => {
+  try {
+    const { endpoint } = req.body || {};
+    if (!endpoint) {
+      return res.status(400).json({ success: false, error: "Falta 'endpoint'." });
+    }
+    const resultado = await push.enviarPush(
+      {
+        title: "Notificaciones activadas ✅",
+        body: "Así vas a ver los mensajes nuevos, aunque la app esté cerrada.",
+        tag: "prueba-push",
+        url: "/",
+        siempre: true, // se muestra aunque la app esté abierta
+      },
+      endpoint
+    );
+    res.json({ success: true, ...resultado });
+  } catch (err) {
+    console.error("[Push] test:", err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -421,8 +503,27 @@ async function procesarMensajeEntrante(msg, contactName) {
   // automática (Gemini no "ve" el archivo en este flujo).
   if (AI_AUTORESPONDER_ACTIVO && msg.type === "text" && textoMensaje.trim()) {
     try {
+      // Si contestaste vos hace poco, el bot no interviene.
+      const pausaInicial = await iaPausadaHasta(numeroLimpio);
+      if (pausaInicial) {
+        console.log(
+          `🤖⏸️ IA pausada para ${numeroLimpio} hasta ${pausaInicial.toISOString()}. No se responde.`
+        );
+        return;
+      }
+
       const historial = await obtenerHistorialParaIA(numeroLimpio);
       const respuestaIA = await responderConIA(textoMensaje, historial);
+
+      // Gemini puede tardar varios segundos: si mientras tanto contestaste
+      // vos a mano, se descarta la respuesta del bot para no pisarte.
+      const pausaTardia = await iaPausadaHasta(numeroLimpio);
+      if (pausaTardia) {
+        console.log(
+          `🤖⏸️ Contestaste a ${numeroLimpio} mientras la IA pensaba. Se descarta su respuesta.`
+        );
+        return;
+      }
 
       if (respuestaIA && respuestaIA.trim()) {
         await enviarRespuestaSoporte(numeroLimpio, respuestaIA.trim());
