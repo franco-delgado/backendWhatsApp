@@ -8,9 +8,7 @@ const { descargarMediaWhatsApp, enviarTextoLibreWhatsApp } = require("./whatsapp
 const { procesarEnvio } = require("./utils/whatsappProcessor");
 const { responderConIA } = require("./utils/aiAgent");
 const push = require("./utils/pushService");
-
 const { pausarIA, iaPausadaHasta, reanudarIA, listarPausasActivas, MINUTOS_POR_DEFECTO } = require("./utils/pausaIA");
-
 
 // Interruptor general del agente de IA. Poné AI_AUTORESPONDER=false en
 // Render (Environment) si alguna vez necesitás apagarlo sin tocar código.
@@ -147,6 +145,7 @@ app.get("/api/mensajes", async (req, res) => {
       cuerpo: m.body,
       URL_de_medios: m.media_url,
       tipo_mime: m.mime_type,
+      estado: m.status || null, // sent | delivered | read | failed (solo salientes)
       created_at: m.created_at,
     }));
 
@@ -229,14 +228,24 @@ async function enviarRespuestaSoporte(numeroLimpio, texto, contextMessageId = nu
 
   const respuestaId = result?.messages?.[0]?.id || `out_${Date.now()}`;
 
-  const { error: sbErr } = await supabase.from("messages").insert([
-    {
-      sender: `Soporte (${numeroLimpio})`,
-      body: texto,
-      media_url: null,
-      mime_type: "text/plain",
-    },
-  ]);
+  const registro = {
+    sender: `Soporte (${numeroLimpio})`,
+    body: texto,
+    media_url: null,
+    mime_type: "text/plain",
+  };
+
+  // wa_message_id permite después cruzar los avisos de Meta (entregado/leído)
+  // con este mensaje. Si todavía no corriste estado_mensajes.sql, las columnas
+  // no existen: reintentamos sin ellas para NO perder el mensaje guardado.
+  let { error: sbErr } = await supabase
+    .from("messages")
+    .insert([{ ...registro, wa_message_id: result?.messages?.[0]?.id || null, status: "sent" }]);
+
+  if (sbErr && (sbErr.code === "PGRST204" || sbErr.code === "42703")) {
+    console.warn("[Supabase] Faltan las columnas wa_message_id/status (correr estado_mensajes.sql). Se guarda sin estado.");
+    ({ error: sbErr } = await supabase.from("messages").insert([registro]));
+  }
 
   if (sbErr) {
     console.error("[Supabase Outbound Error]:", sbErr.message);
@@ -292,62 +301,6 @@ app.get("/api/ia/pausas", async (req, res) => {
 app.delete("/api/ia/pausas/:numero", async (req, res) => {
   await reanudarIA(req.params.numero);
   res.json({ success: true, message: "Bot reactivado para este contacto." });
-});
-
-// =========================================================================
-// NOTIFICACIONES PUSH
-// =========================================================================
-app.get("/api/push/public-key", (req, res) => {
-  if (!push.pushActivo()) {
-    return res
-      .status(503)
-      .json({ success: false, error: "Push no configurado en el servidor (faltan claves VAPID)." });
-  }
-  res.json({ success: true, publicKey: push.VAPID_PUBLIC_KEY });
-});
-
-app.post("/api/push/subscribe", async (req, res) => {
-  try {
-    await push.guardarSuscripcion(req.body);
-    res.json({ success: true });
-  } catch (err) {
-    console.error("[Push] subscribe:", err.message);
-    res.status(400).json({ success: false, error: err.message });
-  }
-});
-
-app.post("/api/push/unsubscribe", async (req, res) => {
-  try {
-    await push.eliminarSuscripcion(req.body?.endpoint);
-    res.json({ success: true });
-  } catch (err) {
-    console.error("[Push] unsubscribe:", err.message);
-    res.status(400).json({ success: false, error: err.message });
-  }
-});
-
-// Manda una notificación de prueba SOLO al dispositivo que la pide.
-app.post("/api/push/test", async (req, res) => {
-  try {
-    const { endpoint } = req.body || {};
-    if (!endpoint) {
-      return res.status(400).json({ success: false, error: "Falta 'endpoint'." });
-    }
-    const resultado = await push.enviarPush(
-      {
-        title: "Notificaciones activadas ✅",
-        body: "Así vas a ver los mensajes nuevos, aunque la app esté cerrada.",
-        tag: "prueba-push",
-        url: "/",
-        siempre: true, // se muestra aunque la app esté abierta
-      },
-      endpoint
-    );
-    res.json({ success: true, ...resultado });
-  } catch (err) {
-    console.error("[Push] test:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
 });
 
 // =========================================================================
@@ -603,27 +556,12 @@ app.post("/webhook", (req, res) => {
         if (Array.isArray(value?.statuses)) {
           for (const status of value.statuses) {
             console.log(`[Status Update] ID: ${status.id} | Estado: ${status.status}`);
-
-            const primerError = status.errors?.[0];
-            if (primerError) {
+            if (status.errors?.length) {
               console.error("[Status Error]:", JSON.stringify(status.errors));
             }
-
-            // Actualiza message_log con el estado real (sent/delivered/read/failed)
-            // y, si vino, el código y detalle del error de Meta.
-            const { error: sbErr } = await supabase
-              .from("message_log")
-              .update({
-                status: status.status,
-                error_code: primerError?.code ? String(primerError.code) : null,
-                error_detalle: primerError?.title || primerError?.message || null,
-                updated_at: new Date().toISOString(),
-              })
-              .eq("id", status.id);
-
-            if (sbErr) {
-              console.error("[message_log] Error al actualizar status:", sbErr.message);
-            }
+            await actualizarEstadoMensaje(status).catch((e) =>
+              console.error("[Status] Error actualizando estado:", e.message)
+            );
           }
         }
 
@@ -654,38 +592,32 @@ app.post("/webhook", (req, res) => {
   });
 });
 
+// Guarda en Supabase el estado que informa Meta para un mensaje saliente.
+// "sent" ya se guarda al enviar, así que acá solo llegan delivered / read / failed.
+// Los avisos pueden llegar desordenados: "delivered" nunca pisa a "read".
+async function actualizarEstadoMensaje(status) {
+  const nuevo = status?.status;
+  if (!status?.id || !["delivered", "read", "failed"].includes(nuevo)) return;
+
+  let q = supabase.from("messages").update({ status: nuevo }).eq("wa_message_id", status.id);
+  if (nuevo === "delivered") q = q.or("status.is.null,status.eq.sent");
+
+  const { error } = await q;
+  if (error) {
+    if (error.code === "42703" || error.code === "PGRST204") {
+      console.warn("[Status] Faltan columnas: correr estado_mensajes.sql en Supabase.");
+    } else {
+      console.error("[Status] Error de Supabase:", error.message);
+    }
+  }
+}
+
 function coincideNumero(a, b) {
   const da = String(a || "").replace(/\D/g, "");
   const db = String(b || "").replace(/\D/g, "");
   if (!da || !db) return false;
   return da.slice(-8) === db.slice(-8);
 }
-
-// Consulta el estado real de mensajes enviados. Filtros opcionales por
-// query string: ?numero=549..., ?template=invitacion2109, ?status=failed
-app.get("/api/message-log", async (req, res) => {
-  try {
-    const { numero, template, status, limit = 50 } = req.query;
-
-    let query = supabase
-      .from("message_log")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(Number(limit));
-
-    if (numero) query = query.eq("numero_destino", String(numero).replace(/\D/g, ""));
-    if (template) query = query.eq("template_name", template);
-    if (status) query = query.eq("status", status);
-
-    const { data, error } = await query;
-    if (error) throw error;
-
-    res.json({ success: true, count: data.length, data });
-  } catch (error) {
-    console.error("[Servidor] Error en /api/message-log:", error.message);
-    res.status(500).json({ success: false, error: "Error al consultar message_log." });
-  }
-});
 
 // =========================================================================
 // ENDPOINTS DE ENVÍO MASIVO / INDIVIDUAL
