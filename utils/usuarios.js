@@ -123,6 +123,8 @@ function publico(u) {
     role: u.role,
     activo: u.activo,
     ia_activa: u.ia_activa,
+    // El admin puede bloquear el bot de un usuario (false). Si la columna aún no existe, se asume permitido.
+    ia_permitida: u.ia_permitida !== false,
     phone_number_id: u.phone_number_id || null,
     tiene_token: Boolean(u.meta_access_token),
     usa_numero_compartido: !u.phone_number_id || esLineaCompartida(u.phone_number_id),

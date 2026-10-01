@@ -45,7 +45,7 @@ process.on("uncaughtException", (err) => {
 app.use(
   cors({
     origin: "*",
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Bypass-Tunnel-Reminder"],
     // credentials:true es incompatible con origin:"*" y el navegador rechaza
     // la respuesta. Si algún día necesitás cookies, poné el origen exacto.
@@ -588,8 +588,9 @@ async function procesarMensajeEntrante(msg, contactName, usuario, compartido = f
   // Agente de IA: solo para mensajes de texto con contenido real. Los
   // audios/imágenes se guardan igual arriba, pero no disparan respuesta
   // automática (Gemini no "ve" el archivo en este flujo).
-  // El bot solo responde para usuarios con ia_activa (el prompt es de Farmanor Pay).
-  if (AI_AUTORESPONDER_ACTIVO && usuario.activo && usuario.ia_activa && msg.type === "text" && textoMensaje.trim()) {
+  // El bot solo responde si: el usuario está activo, el admin no se lo bloqueó (ia_permitida)
+  // y el propio usuario lo tiene encendido (ia_activa).
+  if (AI_AUTORESPONDER_ACTIVO && usuario.activo && usuario.ia_permitida !== false && usuario.ia_activa && msg.type === "text" && textoMensaje.trim()) {
     try {
       // Si contestaste vos hace poco, el bot no interviene.
       const pausaInicial = await iaPausadaHasta(usuario.id, numeroLimpio);

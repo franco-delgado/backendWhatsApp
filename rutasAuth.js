@@ -4,6 +4,7 @@ const { supabase } = require("./supabaseClient");
 const { hashPassword, verifyPassword, crearToken } = require("./utils/seguridad");
 const { requireAuth, requireAdmin } = require("./utils/auth");
 const usuarios = require("./utils/usuarios");
+const { esUuid } = require("./utils/contactos");
 
 const router = express.Router();
 
@@ -41,7 +42,7 @@ function responderError(res, e, contexto) {
   if (errorDeTabla(e)) {
     return res.status(500).json({
       success: false,
-      error: "Falta la estructura de usuarios en la base. Ejecutá usuarios.sql en Supabase > SQL Editor.",
+      error: "Falta la estructura de usuarios en la base. Ejecutá usuarios.sql y bot_usuarios.sql en Supabase > SQL Editor.",
     });
   }
   if (e && e.code === "23505") {
@@ -138,6 +139,7 @@ function leerCampos(body, parcial) {
     out.meta_access_token = v || null;
   }
   if (body.ia_activa !== undefined) out.ia_activa = Boolean(body.ia_activa);
+  if (body.ia_permitida !== undefined) out.ia_permitida = Boolean(body.ia_permitida);
   if (parcial && body.activo !== undefined) out.activo = Boolean(body.activo);
   if (body.role !== undefined) {
     if (!["admin", "user"].includes(body.role)) throw new Error("Rol inválido.");
@@ -188,6 +190,12 @@ router.patch("/api/admin/usuarios/:id", requireAuth, requireAdmin, async (req, r
         .json({ success: false, error: "No podés desactivarte ni quitarte el rol de administrador." });
     }
 
+    // Bloquear el bot a un usuario lo apaga también (si lo vuelve a permitir, lo enciende él).
+    if (cambios.ia_permitida === false && cambios.ia_activa === undefined) cambios.ia_activa = false;
+    if (cambios.ia_permitida === false && cambios.ia_activa === true) {
+      return res.status(400).json({ success: false, error: "No se puede encender el bot de un usuario que lo tiene bloqueado." });
+    }
+
     if (req.body?.password !== undefined && req.body.password !== "") {
       if (String(req.body.password).length < MIN_PASSWORD) {
         return res
@@ -213,6 +221,78 @@ router.patch("/api/admin/usuarios/:id", requireAuth, requireAdmin, async (req, r
   } catch (e) {
     if (e.message && !e.code) return res.status(400).json({ success: false, error: e.message });
     responderError(res, e, "Admin editar usuario");
+  }
+});
+
+// Elimina un usuario (solo administrador).
+//   ?mensajes=transferir (por defecto): sus mensajes y contactos pasan a la bandeja del admin que lo elimina.
+//   ?mensajes=borrar: se borran también sus mensajes (no se puede deshacer).
+// Sus dispositivos con notificaciones y sus pausas del bot se borran solos (ON DELETE CASCADE).
+router.delete("/api/admin/usuarios/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!esUuid(id)) return res.status(400).json({ success: false, error: "Usuario inválido." });
+    if (id === req.user.id) {
+      return res.status(400).json({ success: false, error: "No podés eliminarte a vos mismo." });
+    }
+
+    const destino = await usuarios.obtenerPorId(id);
+    if (!destino) return res.status(404).json({ success: false, error: "Usuario no encontrado." });
+
+    const borrarMensajes = String(req.query.mensajes || "transferir") === "borrar";
+
+    if (borrarMensajes) {
+      const { error } = await supabase.from("messages").delete().eq("user_id", id);
+      if (error) throw error;
+      // contact_owners se borra por cascada: sus contactos quedan sin dueño (los recibe el admin).
+    } else {
+      const { error: e1 } = await supabase.from("messages").update({ user_id: req.user.id }).eq("user_id", id);
+      if (e1) throw e1;
+      const { error: e2 } = await supabase.from("contact_owners").update({ user_id: req.user.id }).eq("user_id", id);
+      if (e2 && e2.code !== "42P01" && e2.code !== "PGRST205") throw e2; // sin compartido.sql no hay tabla: no importa
+    }
+
+    const { error } = await supabase.from("app_users").delete().eq("id", id);
+    if (error) throw error;
+
+    usuarios.invalidarCache();
+    res.json({
+      success: true,
+      message: `Usuario "${destino.username}" eliminado${borrarMensajes ? " junto con sus mensajes" : " (sus mensajes pasaron a tu bandeja)"}.`,
+    });
+  } catch (e) {
+    responderError(res, e, "Admin eliminar usuario");
+  }
+});
+
+// ---------------------------------------------------- bot de IA (cada usuario)
+// Cada usuario enciende/apaga SU bot. Si el admin se lo bloqueó, no puede encenderlo.
+router.get("/api/ia/mi-estado", requireAuth, (req, res) => {
+  const u = usuarios.publico(req.user);
+  res.json({ success: true, ia_activa: u.ia_activa, ia_permitida: u.ia_permitida });
+});
+
+router.patch("/api/ia/mi-estado", requireAuth, async (req, res) => {
+  try {
+    if (typeof req.body?.ia_activa !== "boolean") {
+      return res.status(400).json({ success: false, error: "Falta el campo ia_activa (true/false)." });
+    }
+    if (req.body.ia_activa && req.user.ia_permitida === false) {
+      return res
+        .status(403)
+        .json({ success: false, error: "El administrador bloqueó el bot para tu usuario." });
+    }
+    const { data, error } = await supabase
+      .from("app_users")
+      .update({ ia_activa: req.body.ia_activa })
+      .eq("id", req.user.id)
+      .select()
+      .single();
+    if (error) throw error;
+    usuarios.invalidarCache();
+    res.json({ success: true, usuario: usuarios.publico(data) });
+  } catch (e) {
+    responderError(res, e, "IA mi-estado");
   }
 });
 
