@@ -98,24 +98,31 @@ async function reanudarIA(userId, numero) {
 }
 
 // Lista de pausas vigentes (para que el frontend muestre el estado).
+// userId = "todos" (solo lo pide el admin) devuelve las de todos los usuarios.
 async function listarPausasActivas(userId) {
+  const todos = !userId || userId === "todos";
   try {
-    const { data, error } = await supabase
+    let q = supabase
       .from("ia_pausas")
-      .select("numero, pausado_hasta")
-      .eq("user_id", userId)
+      .select("user_id, numero, pausado_hasta")
       .gt("pausado_hasta", new Date().toISOString());
+    if (!todos) q = q.eq("user_id", userId);
+    const { data, error } = await q;
     if (error) throw error;
     return data || [];
   } catch (e) {
     // Fallback: lo que haya en memoria.
     const ahora = Date.now();
     return [...cache.entries()]
-      .filter(([k, hasta]) => k.startsWith(`${userId}:`) && hasta > ahora)
-      .map(([k, hasta]) => ({
-        numero: k.slice(userId.length + 1),
-        pausado_hasta: new Date(hasta).toISOString(),
-      }));
+      .filter(([k, hasta]) => (todos || k.startsWith(`${userId}:`)) && hasta > ahora)
+      .map(([k, hasta]) => {
+        const i = k.indexOf(":");
+        return {
+          user_id: k.slice(0, i),
+          numero: k.slice(i + 1),
+          pausado_hasta: new Date(hasta).toISOString(),
+        };
+      });
   }
 }
 

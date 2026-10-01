@@ -1,6 +1,7 @@
 // Middlewares de Express: exigen sesión válida y, opcionalmente, rol admin.
 const { verificarToken, versionPassword } = require("./seguridad");
 const usuarios = require("./usuarios");
+const { esUuid } = require("./contactos");
 
 async function requireAuth(req, res, next) {
   const h = req.headers.authorization || "";
@@ -29,13 +30,19 @@ function requireAdmin(req, res, next) {
 }
 
 // Usuario cuyos datos se consultan. Cada uno solo ve los propios; el admin
-// puede pedir los de otro con ?userId=<id>.
+// puede pedir los de otro con ?userId=<id>, o los de todos con ?userId=todos.
 function usuarioObjetivo(req) {
   const pedido = req.query.userId;
   if (!pedido || pedido === req.user.id) return req.user.id;
   if (req.user.role !== "admin") {
     const err = new Error("No tenés permiso para ver los datos de otro usuario.");
     err.status = 403;
+    throw err;
+  }
+  if (pedido === "todos") return "todos";
+  if (!esUuid(pedido)) {
+    const err = new Error("userId inválido.");
+    err.status = 400;
     throw err;
   }
   return String(pedido);

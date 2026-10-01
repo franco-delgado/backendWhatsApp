@@ -11,6 +11,7 @@ const push = require("./utils/pushService");
 const { pausarIA, iaPausadaHasta, reanudarIA, listarPausasActivas, MINUTOS_POR_DEFECTO } = require("./utils/pausaIA");
 const { requireAuth, requireAdmin, usuarioObjetivo } = require("./utils/auth");
 const usuarios = require("./utils/usuarios");
+const contactos = require("./utils/contactos");
 
 // Interruptor general del agente de IA. Poné AI_AUTORESPONDER=false en
 // Render (Environment) si alguna vez necesitás apagarlo sin tocar código.
@@ -125,15 +126,25 @@ app.get("/api/diag", requireAuth, requireAdmin, async (req, res) => {
 // ENDPOINTS DE MENSAJES (API REST)
 // =========================================================================
 
+// Supabase/PostgREST devuelve como mucho 1000 filas por consulta. Pedimos los
+// MÁS RECIENTES (antes, sin orden descendente, a partir de la fila 1001 los
+// mensajes nuevos dejaban de aparecer).
+const MAX_MENSAJES = 1000;
+
 app.get("/api/mensajes", requireAuth, async (req, res) => {
   try {
-    // Cada usuario ve SOLO sus mensajes. El admin puede pedir los de otro con ?userId=
-    const userId = usuarioObjetivo(req);
-    const { data: mensajes, error } = await supabase
+    // Cada usuario ve SOLO sus mensajes. El admin puede pedir los de otro con
+    // ?userId=<id>, o los de todos con ?userId=todos.
+    const objetivo = usuarioObjetivo(req);
+
+    let consulta = supabase
       .from("messages")
       .select("*")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: false })
+      .range(0, MAX_MENSAJES - 1);
+    if (objetivo !== "todos") consulta = consulta.eq("user_id", objetivo);
+
+    const { data: mensajes, error } = await consulta;
 
     if (error) {
       console.error("❌ ERROR DIRECTO DE SUPABASE:", error);
@@ -146,7 +157,14 @@ app.get("/api/mensajes", requireAuth, async (req, res) => {
       });
     }
 
-    const mensajesFormateados = (mensajes || []).map((m) => ({
+    // El admin ve de quién es cada conversación (para poder reasignarla).
+    let nombres = {};
+    if (req.user.role === "admin") {
+      const { data: us } = await supabase.from("app_users").select("id, username");
+      nombres = Object.fromEntries((us || []).map((u) => [u.id, u.username]));
+    }
+
+    const mensajesFormateados = (mensajes || []).reverse().map((m) => ({
       id: m.id,
       remitente: m.sender,
       // Número limpio y nombre por separado: el frontend agrupa por número,
@@ -158,6 +176,9 @@ app.get("/api/mensajes", requireAuth, async (req, res) => {
       URL_de_medios: m.media_url,
       tipo_mime: m.mime_type,
       estado: m.status || null, // sent | delivered | read | failed (solo salientes)
+      wamid: m.wa_message_id || null, // id de WhatsApp: sirve para citar el mensaje al responder
+      usuario_id: m.user_id || null, // dueño de la conversación
+      usuario: nombres[m.user_id] || null, // (solo lo recibe el admin)
       created_at: m.created_at,
     }));
 
@@ -167,7 +188,9 @@ app.get("/api/mensajes", requireAuth, async (req, res) => {
       data: mensajesFormateados,
     });
   } catch (err) {
-    if (err.status === 403) return res.status(403).json({ success: false, error: err.message });
+    if (err.status === 403 || err.status === 400) {
+      return res.status(err.status).json({ success: false, error: err.message });
+    }
     console.error("❌ EXCEPCIÓN DE SERVIDOR:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -183,6 +206,28 @@ function extraerNombre(sender) {
   const m = String(sender || "").match(/^(.*?)\s*\([^)]*\)\s*$/);
   return m ? m[1].trim() : String(sender || "");
 }
+
+// Borra toda la conversación con un contacto (solo los mensajes del usuario que lo pide).
+// Coincide por los últimos 10 dígitos: entrantes ("Franco (549…)") y salientes ("Soporte (54…)").
+app.delete("/api/mensajes/contacto/:numero", requireAuth, async (req, res) => {
+  try {
+    const k = contactos.ultimos10(req.params.numero);
+    if (!k) return res.status(400).json({ success: false, error: "Número inválido." });
+
+    const { data, error } = await supabase
+      .from("messages")
+      .delete()
+      .eq("user_id", req.user.id)
+      .ilike("sender", `%${k})`)
+      .select("id");
+    if (error) throw error;
+
+    res.json({ success: true, eliminados: data?.length || 0 });
+  } catch (error) {
+    console.error("[Servidor] Error al eliminar conversación:", error.message);
+    res.status(500).json({ success: false, error: "Error interno al eliminar la conversación." });
+  }
+});
 
 app.delete("/api/mensajes/:id", requireAuth, async (req, res) => {
   try {
@@ -230,38 +275,69 @@ app.delete("/api/mensajes", requireAuth, async (req, res) => {
   }
 });
 
+// Guarda un mensaje. Si todavía no corriste estado_mensajes.sql, las columnas
+// opcionales (wa_message_id, status) no existen: reintenta sin ellas para NO perder el mensaje.
+const COLUMNAS_OPCIONALES = ["wa_message_id", "status"];
+async function guardarMensaje(registro) {
+  let { error } = await supabase.from("messages").insert([registro]);
+  if (error && (error.code === "PGRST204" || error.code === "42703")) {
+    console.warn("[Supabase] Faltan las columnas wa_message_id/status (correr estado_mensajes.sql). Se guarda sin ellas.");
+    const basico = { ...registro };
+    for (const c of COLUMNAS_OPCIONALES) delete basico[c];
+    ({ error } = await supabase.from("messages").insert([basico]));
+  }
+  return { error };
+}
+
 // Usada tanto por el endpoint manual como por el agente de IA: manda el
 // mensaje por WhatsApp y lo deja guardado en Supabase como "Soporte (numero)".
+// Devuelve { result, duenioId }: la conversación queda en la bandeja de su dueño.
 async function enviarRespuestaSoporte(usuario, numeroLimpio, texto, contextMessageId = null) {
+  const credenciales = usuarios.credencialesMeta(usuario); // envía desde el número de ESTE usuario (o el compartido)
+
+  // Número compartido: solo se le escribe a contactos propios o libres (el admin, a cualquiera).
+  let duenioPrevio = null;
+  if (credenciales.compartido) {
+    duenioPrevio = await contactos.verificarPermisoEnvio(usuario, numeroLimpio);
+  }
+
+  // Meta espera el id de WhatsApp ("wamid.…") para citar; con cualquier otra cosa falla.
+  const contexto =
+    typeof contextMessageId === "string" && contextMessageId.startsWith("wamid.")
+      ? contextMessageId
+      : null;
+
   const result = await procesarEnvio({
     to: numeroLimpio,
     type: "text",
     text: texto,
-    contextMessageId,
-    credenciales: usuarios.credencialesMeta(usuario), // envía desde el número de ESTE usuario
+    contextMessageId: contexto,
+    credenciales,
   });
+
+  // Enviado: si el contacto estaba libre, pasa a ser de quien le escribió.
+  let duenioId = usuario.id;
+  if (credenciales.compartido) {
+    duenioId =
+      duenioPrevio ||
+      (await contactos.reclamarSiLibre(usuario, numeroLimpio).catch((e) => {
+        console.warn("[Contactos] No se pudo registrar el dueño del contacto:", e.message);
+        return usuario.id;
+      }));
+  }
 
   const respuestaId = result?.messages?.[0]?.id || `out_${Date.now()}`;
 
-  const registro = {
-    user_id: usuario.id,
+  const { error: sbErr } = await guardarMensaje({
+    user_id: duenioId,
     sender: `Soporte (${numeroLimpio})`,
     body: texto,
     media_url: null,
     mime_type: "text/plain",
-  };
-
-  // wa_message_id permite después cruzar los avisos de Meta (entregado/leído)
-  // con este mensaje. Si todavía no corriste estado_mensajes.sql, las columnas
-  // no existen: reintentamos sin ellas para NO perder el mensaje guardado.
-  let { error: sbErr } = await supabase
-    .from("messages")
-    .insert([{ ...registro, wa_message_id: result?.messages?.[0]?.id || null, status: "sent" }]);
-
-  if (sbErr && (sbErr.code === "PGRST204" || sbErr.code === "42703")) {
-    console.warn("[Supabase] Faltan las columnas wa_message_id/status (correr estado_mensajes.sql). Se guarda sin estado.");
-    ({ error: sbErr } = await supabase.from("messages").insert([registro]));
-  }
+    // wa_message_id permite después cruzar los avisos de Meta (entregado/leído) con este mensaje.
+    wa_message_id: result?.messages?.[0]?.id || null,
+    status: "sent",
+  });
 
   if (sbErr) {
     console.error("[Supabase Outbound Error]:", sbErr.message);
@@ -269,7 +345,7 @@ async function enviarRespuestaSoporte(usuario, numeroLimpio, texto, contextMessa
     console.log(`⚡ Respuesta ${respuestaId} guardada en Supabase.`);
   }
 
-  return result;
+  return { result, duenioId };
 }
 
 app.post("/api/mensajes/responder", requireAuth, async (req, res) => {
@@ -287,12 +363,17 @@ app.post("/api/mensajes/responder", requireAuth, async (req, res) => {
     }
 
     const numeroLimpio = String(destinatario).replace(/\D/g, "");
-    const result = await enviarRespuestaSoporte(req.user, numeroLimpio, mensaje, contextMessageId || null);
+    const { result, duenioId } = await enviarRespuestaSoporte(
+      req.user,
+      numeroLimpio,
+      mensaje,
+      contextMessageId || null
+    );
 
     // Contestaste vos a mano: el bot se calla un rato para no pisar la charla.
     // Cada respuesta manual renueva el plazo. Se pausa DESPUÉS de enviar, así
     // si el envío falla (ej. error 131047) el bot no queda apagado en vano.
-    const pausadaHasta = await pausarIA(req.user.id, numeroLimpio);
+    const pausadaHasta = await pausarIA(duenioId, numeroLimpio);
 
     res.json({
       success: true,
@@ -303,7 +384,29 @@ app.post("/api/mensajes/responder", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("[Servidor] Error en /api/mensajes/responder:", err.message);
-    res.status(400).json({ success: false, error: err.message });
+    res.status(err.status || 400).json({ success: false, error: err.message });
+  }
+});
+
+// Solo administrador: pasa un contacto (con todo su historial) a otro usuario.
+// Sirve para repartir los contactos que escribieron por su cuenta (los recibe el admin).
+app.post("/api/admin/contactos/asignar", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { numero, userId } = req.body || {};
+    if (!contactos.ultimos10(numero)) {
+      return res.status(400).json({ success: false, error: "Número inválido." });
+    }
+    if (!contactos.esUuid(userId)) {
+      return res.status(400).json({ success: false, error: "Usuario inválido." });
+    }
+    const destino = await usuarios.obtenerPorId(userId);
+    if (!destino) return res.status(404).json({ success: false, error: "Usuario no encontrado." });
+
+    const data = await contactos.asignarContacto(numero, userId, req.user.id);
+    res.json({ success: true, message: `Contacto asignado a ${destino.username}.`, data });
+  } catch (err) {
+    console.error("[Servidor] Error en /api/admin/contactos/asignar:", err.message);
+    res.status(err.status || 500).json({ success: false, error: err.message });
   }
 });
 
@@ -401,9 +504,10 @@ app.get("/webhook", (req, res) => {
   res.sendStatus(403);
 });
 
-async function procesarMensajeEntrante(msg, contactName, usuario) {
-  // Token con el que se descargan los adjuntos (el propio del usuario o el del .env).
-  const cred = { token: usuario.meta_access_token || undefined };
+async function procesarMensajeEntrante(msg, contactName, usuario, compartido = false) {
+  // Token con el que se descargan los adjuntos: en el número compartido el del .env;
+  // en el número propio de un usuario, el suyo (si cargó uno).
+  const cred = { token: (!compartido && usuario.meta_access_token) || undefined };
   let textoMensaje = "";
   let mediaUrl = null;
   let mimeType = "text/plain";
@@ -449,15 +553,14 @@ async function procesarMensajeEntrante(msg, contactName, usuario) {
   // El insert AHORA está dentro del try/catch. Antes estaba afuera y cualquier
   // fallo de red contra Supabase tumbaba el proceso entero.
   try {
-    const { error: sbErr } = await supabase.from("messages").insert([
-      {
-        user_id: usuario.id,
-        sender: `${contactName} (${numeroLimpio})`,
-        body: textoMensaje,
-        media_url: mediaUrl,
-        mime_type: mimeType,
-      },
-    ]);
+    const { error: sbErr } = await guardarMensaje({
+      user_id: usuario.id,
+      sender: `${contactName} (${numeroLimpio})`,
+      body: textoMensaje,
+      media_url: mediaUrl,
+      mime_type: mimeType,
+      wa_message_id: msg.id || null, // permite citar este mensaje al responder
+    });
 
     if (sbErr) {
       console.error("[Supabase Error]:", sbErr.message, sbErr.details || "", sbErr.hint || "");
@@ -466,6 +569,14 @@ async function procesarMensajeEntrante(msg, contactName, usuario) {
     }
   } catch (e) {
     console.error("[Supabase Excepción al insertar]:", e.message);
+  }
+
+  // Número compartido: un contacto sin dueño que escribió por su cuenta queda a nombre de
+  // quien lo recibe (el admin). Así tiene UN solo dueño y no se parte su historial.
+  if (compartido) {
+    await contactos.reclamarSiLibre(usuario, numeroLimpio).catch((e) =>
+      console.warn("[Contactos] No se pudo registrar el dueño del contacto:", e.message)
+    );
   }
 
   // Notificación push al celular/PC. Sin await a propósito: no debe demorar
@@ -478,7 +589,7 @@ async function procesarMensajeEntrante(msg, contactName, usuario) {
   // audios/imágenes se guardan igual arriba, pero no disparan respuesta
   // automática (Gemini no "ve" el archivo en este flujo).
   // El bot solo responde para usuarios con ia_activa (el prompt es de Farmanor Pay).
-  if (AI_AUTORESPONDER_ACTIVO && usuario.ia_activa && msg.type === "text" && textoMensaje.trim()) {
+  if (AI_AUTORESPONDER_ACTIVO && usuario.activo && usuario.ia_activa && msg.type === "text" && textoMensaje.trim()) {
     try {
       // Si contestaste vos hace poco, el bot no interviene.
       const pausaInicial = await iaPausadaHasta(usuario.id, numeroLimpio);
@@ -524,7 +635,7 @@ async function obtenerHistorialParaIA(userId, numeroLimpio, limite = 10) {
     .from("messages")
     .select("sender, body, created_at")
     .eq("user_id", userId)
-    .ilike("sender", `%(${numeroLimpio})`)
+    .ilike("sender", `%${contactos.ultimos10(numeroLimpio)})`) // entrantes (549…) y salientes (54…)
     .order("created_at", { ascending: false })
     .limit(limite + 1);
 
@@ -591,16 +702,20 @@ app.post("/webhook", (req, res) => {
         }
 
         if (Array.isArray(value?.messages)) {
-          // ¿A cuál de tus usuarios le escribieron? Se decide por el número de
-          // WhatsApp de destino (metadata.phone_number_id). Si no está asignado
-          // a nadie, lo recibe el administrador.
-          const duenio = await usuarios.resolverDuenioWebhook(value?.metadata?.phone_number_id);
-          if (!duenio) {
-            console.error("[Webhook] No se pudo determinar el usuario dueño del mensaje. Se descarta.");
-            continue;
-          }
+          // ¿A cuál de tus usuarios le escribieron?
+          //  - Número propio de un usuario: se decide por metadata.phone_number_id.
+          //  - Número compartido: se decide por el dueño del contacto (contact_owners);
+          //    si el contacto no tiene dueño, lo recibe el administrador.
+          const phoneId = value?.metadata?.phone_number_id;
+          const compartido = usuarios.esLineaCompartida(phoneId);
 
           for (const msg of value.messages) {
+            const duenio = await usuarios.resolverDuenioWebhook(phoneId, msg.from);
+            if (!duenio) {
+              console.error("[Webhook] No se pudo determinar el usuario dueño del mensaje. Se descarta.");
+              continue;
+            }
+
             if (yaProcesado(msg.id)) {
               console.log(`[Webhook] Duplicado ignorado: ${msg.id}`);
               continue;
@@ -614,7 +729,7 @@ app.post("/webhook", (req, res) => {
             const contactName = contactObj?.profile?.name || "Desconocido";
 
             // await + catch: nunca más una promesa huérfana.
-            await procesarMensajeEntrante(msg, contactName, duenio).catch((e) =>
+            await procesarMensajeEntrante(msg, contactName, duenio, compartido).catch((e) =>
               console.error("[procesarMensajeEntrante]:", e.message)
             );
           }
@@ -659,15 +774,26 @@ function coincideNumero(a, b) {
 
 app.post("/send", requireAuth, async (req, res) => {
   try {
+    const body = req.body || {};
+    const credenciales = usuarios.credencialesMeta(req.user);
+    const destino = body.number || body.to || body.phone;
+
+    // Número compartido: no se le puede escribir a un contacto que es de otro usuario.
+    if (credenciales.compartido) await contactos.verificarPermisoEnvio(req.user, destino);
+
     // `credenciales` va al final: el cliente no puede mandar las suyas para usar otro número.
-    const result = await procesarEnvio({
-      ...(req.body || {}),
-      credenciales: usuarios.credencialesMeta(req.user),
-    });
+    const result = await procesarEnvio({ ...body, credenciales });
+
+    // Enviado: si el contacto estaba libre, pasa a ser tuyo (así sus respuestas te llegan a vos).
+    if (credenciales.compartido) {
+      await contactos.reclamarSiLibre(req.user, destino).catch((e) =>
+        console.warn("[Contactos] No se pudo registrar el dueño del contacto:", e.message)
+      );
+    }
     res.json({ success: true, message: "Mensaje procesado con éxito.", data: result });
   } catch (err) {
     console.error("[Servidor] Error en /send:", err.message);
-    res.status(400).json({ success: false, error: err.message });
+    res.status(err.status || 400).json({ success: false, error: err.message });
   }
 });
 
@@ -690,17 +816,34 @@ app.post("/send-bulk", requireAuth, async (req, res) => {
   const results = [];
   for (let i = 0; i < contacts.length; i++) {
     const contact = contacts[i];
+    const destino = contact.number || contact.to || contact.phone;
     try {
+      // Número compartido: los contactos de otro usuario se saltan (con su error en el resultado).
+      if (credenciales.compartido) await contactos.verificarPermisoEnvio(req.user, destino);
+
       const response = await procesarEnvio({ ...contact, credenciales });
-      results.push({ number: contact.number || contact.to, status: "success", response });
+
+      if (credenciales.compartido) {
+        await contactos.reclamarSiLibre(req.user, destino).catch((e) =>
+          console.warn("[Contactos] No se pudo registrar el dueño del contacto:", e.message)
+        );
+      }
+      results.push({ number: destino, status: "success", response });
     } catch (err) {
-      results.push({ number: contact.number || contact.to, status: "error", error: err.message });
+      results.push({ number: destino, status: "error", error: err.message });
     }
 
     if (i < contacts.length - 1) await delay(delayMs);
   }
 
-  res.json({ success: true, processed: results.length, results });
+  const errores = results.filter((r) => r.status === "error");
+  res.json({
+    success: true,
+    processed: results.length,
+    enviados: results.length - errores.length,
+    fallidos: errores.length,
+    results,
+  });
 });
 
 // 404 explícito: así distinguís "ruta inexistente" de "servidor caído".

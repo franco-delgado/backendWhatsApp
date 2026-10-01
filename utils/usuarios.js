@@ -1,6 +1,7 @@
 // Acceso a la tabla app_users + reglas de "de quién es cada número de WhatsApp".
 const { supabase } = require("../supabaseClient");
 const { hashPassword } = require("./seguridad");
+const contactos = require("./contactos");
 
 const TTL_MS = 30 * 1000;
 const cachePorId = new Map(); // id -> { user, hasta }
@@ -48,12 +49,20 @@ async function obtenerAdmin() {
   return admin;
 }
 
-// Dueño de un mensaje entrante según el número de WhatsApp (phone_number_id)
-// al que escribió el cliente. Si ningún usuario lo tiene asignado, lo recibe el
-// administrador (así el número original de tu .env sigue funcionando igual).
-async function resolverDuenioWebhook(phoneNumberId) {
+// ¿Este phone_number_id es el número COMPARTIDO (el del .env)? Sin id también cuenta
+// como compartido: es lo que pasaba antes (todo caía en el número principal).
+function esLineaCompartida(phoneNumberId) {
+  const pid = phoneNumberId ? String(phoneNumberId) : "";
+  return !pid || pid === String(process.env.META_PHONE_NUMBER_ID || "");
+}
+
+// Dueño de un mensaje entrante.
+//  - Número propio de un usuario (phone_number_id asignado): es de ese usuario.
+//  - Número compartido: es del dueño del contacto (contact_owners). Si el contacto
+//    todavía no tiene dueño, lo recibe el administrador, que después puede reasignarlo.
+async function resolverDuenioWebhook(phoneNumberId, numeroContacto) {
   try {
-    if (phoneNumberId) {
+    if (!esLineaCompartida(phoneNumberId)) {
       const c = cachePorNumero.get(phoneNumberId);
       if (c && c.hasta > Date.now()) return c.user;
       const { data, error } = await supabase
@@ -66,6 +75,19 @@ async function resolverDuenioWebhook(phoneNumberId) {
         cachePorNumero.set(phoneNumberId, { user: data, hasta: Date.now() + TTL_MS });
         return data;
       }
+      return await obtenerAdmin(); // número desconocido: lo recibe el admin (como antes)
+    }
+
+    // Línea compartida: manda el dueño del contacto.
+    let duenioId = null;
+    try {
+      duenioId = await contactos.duenioDeContacto(numeroContacto);
+    } catch (e) {
+      console.warn("[Usuarios] No se pudo consultar el dueño del contacto (¿falta compartido.sql?):", e.message);
+    }
+    if (duenioId) {
+      const u = await obtenerPorId(duenioId);
+      if (u) return u; // aunque esté desactivado: así su historial no se parte en dos
     }
     return await obtenerAdmin();
   } catch (e) {
@@ -74,20 +96,24 @@ async function resolverDuenioWebhook(phoneNumberId) {
   }
 }
 
-// Credenciales de Meta con las que envía cada usuario. Solo el administrador
-// puede caer en el número del .env; un usuario sin número asignado NO puede
-// enviar (si no, mandaría desde el número del administrador).
+// Credenciales de Meta con las que envía cada usuario.
+//  - Con phone_number_id propio: usa su número (y su token, si lo cargó).
+//  - Sin número propio: usa el número COMPARTIDO del servidor (META_PHONE_NUMBER_ID).
+// `compartido` indica si se envía por el número compartido; en ese caso aplican
+// los dueños de contacto (contact_owners).
 function credencialesMeta(user) {
-  const phoneNumberId =
-    user.phone_number_id || (user.role === "admin" ? process.env.META_PHONE_NUMBER_ID : null);
-  const token = user.meta_access_token || process.env.META_ACCESS_TOKEN;
+  const phoneNumberId = user.phone_number_id || process.env.META_PHONE_NUMBER_ID;
   if (!phoneNumberId) {
     throw new Error(
-      "Tu usuario no tiene un número de WhatsApp asignado. Pedile al administrador que lo configure."
+      "No hay un número de WhatsApp configurado: falta META_PHONE_NUMBER_ID en el servidor o un número propio para este usuario."
     );
   }
+  const compartido = esLineaCompartida(phoneNumberId);
+  const token = compartido
+    ? process.env.META_ACCESS_TOKEN || user.meta_access_token
+    : user.meta_access_token || process.env.META_ACCESS_TOKEN;
   if (!token) throw new Error("Falta el token de acceso de Meta para este usuario.");
-  return { phoneNumberId, token };
+  return { phoneNumberId, token, compartido };
 }
 
 function publico(u) {
@@ -99,6 +125,7 @@ function publico(u) {
     ia_activa: u.ia_activa,
     phone_number_id: u.phone_number_id || null,
     tiene_token: Boolean(u.meta_access_token),
+    usa_numero_compartido: !u.phone_number_id || esLineaCompartida(u.phone_number_id),
     created_at: u.created_at,
   };
 }
@@ -141,6 +168,7 @@ module.exports = {
   obtenerPorId,
   obtenerAdmin,
   resolverDuenioWebhook,
+  esLineaCompartida,
   credencialesMeta,
   asegurarAdmin,
   invalidarCache,
