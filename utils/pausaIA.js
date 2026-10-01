@@ -3,6 +3,8 @@
 // Cuando vos contestás a mano una conversación, el bot no debe meterse por un
 // tiempo (por defecto 60 min, configurable con IA_PAUSA_MINUTOS en el .env).
 //
+// Cada usuario tiene sus propias pausas: la clave es (usuario + contacto).
+//
 // La pausa se guarda en memoria (rápido) Y en Supabase (tabla ia_pausas), así
 // sobrevive a los reinicios / "sueño" del plan free de Render.
 // Si la tabla todavía no existe, funciona igual solo en memoria y avisa en el log.
@@ -11,17 +13,21 @@ const { supabase } = require("../supabaseClient");
 const MINUTOS_POR_DEFECTO =
   Number(process.env.IA_PAUSA_MINUTOS) > 0 ? Number(process.env.IA_PAUSA_MINUTOS) : 60;
 
-// clave (últimos 10 dígitos) -> timestamp en ms hasta el que está pausado (0 = no pausado)
+// clave (userId:últimos 10 dígitos) -> timestamp en ms hasta el que está pausado (0 = no pausado)
 const cache = new Map();
 
 // En Argentina el mismo celular aparece como 549XXXXXXXXXX (webhook) o
 // 54XXXXXXXXXX (a veces al enviar). Los últimos 10 dígitos son siempre iguales.
-function clave(numero) {
+function ultimos10(numero) {
   return String(numero || "").replace(/\D/g, "").slice(-10);
 }
+function clave(userId, numero) {
+  const n = ultimos10(numero);
+  return userId && n ? `${userId}:${n}` : "";
+}
 
-async function pausarIA(numero, minutos = MINUTOS_POR_DEFECTO) {
-  const k = clave(numero);
+async function pausarIA(userId, numero, minutos = MINUTOS_POR_DEFECTO) {
+  const k = clave(userId, numero);
   if (!k) return null;
 
   const hasta = Date.now() + minutos * 60 * 1000;
@@ -31,8 +37,8 @@ async function pausarIA(numero, minutos = MINUTOS_POR_DEFECTO) {
     const { error } = await supabase
       .from("ia_pausas")
       .upsert(
-        [{ numero: k, pausado_hasta: new Date(hasta).toISOString() }],
-        { onConflict: "numero" }
+        [{ user_id: userId, numero: ultimos10(numero), pausado_hasta: new Date(hasta).toISOString() }],
+        { onConflict: "user_id,numero" }
       );
     if (error) throw error;
   } catch (e) {
@@ -47,8 +53,8 @@ async function pausarIA(numero, minutos = MINUTOS_POR_DEFECTO) {
 }
 
 // Devuelve la Date hasta la que está pausada, o null si la IA puede responder.
-async function iaPausadaHasta(numero) {
-  const k = clave(numero);
+async function iaPausadaHasta(userId, numero) {
+  const k = clave(userId, numero);
   if (!k) return null;
 
   let hasta = cache.get(k);
@@ -59,7 +65,8 @@ async function iaPausadaHasta(numero) {
       const { data, error } = await supabase
         .from("ia_pausas")
         .select("pausado_hasta")
-        .eq("numero", k)
+        .eq("user_id", userId)
+        .eq("numero", ultimos10(numero))
         .maybeSingle();
       if (error) throw error;
       hasta = data ? new Date(data.pausado_hasta).getTime() : 0;
@@ -73,12 +80,16 @@ async function iaPausadaHasta(numero) {
   return hasta > Date.now() ? new Date(hasta) : null;
 }
 
-async function reanudarIA(numero) {
-  const k = clave(numero);
+async function reanudarIA(userId, numero) {
+  const k = clave(userId, numero);
   if (!k) return;
   cache.set(k, 0);
   try {
-    const { error } = await supabase.from("ia_pausas").delete().eq("numero", k);
+    const { error } = await supabase
+      .from("ia_pausas")
+      .delete()
+      .eq("user_id", userId)
+      .eq("numero", ultimos10(numero));
     if (error) throw error;
   } catch (e) {
     console.warn("[PausaIA] No se pudo borrar la pausa en Supabase:", e.message);
@@ -87,11 +98,12 @@ async function reanudarIA(numero) {
 }
 
 // Lista de pausas vigentes (para que el frontend muestre el estado).
-async function listarPausasActivas() {
+async function listarPausasActivas(userId) {
   try {
     const { data, error } = await supabase
       .from("ia_pausas")
       .select("numero, pausado_hasta")
+      .eq("user_id", userId)
       .gt("pausado_hasta", new Date().toISOString());
     if (error) throw error;
     return data || [];
@@ -99,8 +111,11 @@ async function listarPausasActivas() {
     // Fallback: lo que haya en memoria.
     const ahora = Date.now();
     return [...cache.entries()]
-      .filter(([, hasta]) => hasta > ahora)
-      .map(([numero, hasta]) => ({ numero, pausado_hasta: new Date(hasta).toISOString() }));
+      .filter(([k, hasta]) => k.startsWith(`${userId}:`) && hasta > ahora)
+      .map(([k, hasta]) => ({
+        numero: k.slice(userId.length + 1),
+        pausado_hasta: new Date(hasta).toISOString(),
+      }));
   }
 }
 

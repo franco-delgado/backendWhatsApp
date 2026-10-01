@@ -31,9 +31,10 @@ async function _registrarEnvio({ wamid, numeroDestino, tipo, templateName, paylo
  * meta: { numeroDestino, tipo, templateName } — datos extra solo para poder
  * loguear el envío en message_log una vez que Meta confirma el wamid.
  */
-async function _enviarPeticionMeta(data, meta = {}) {
-  const phoneNumberId = process.env.META_PHONE_NUMBER_ID;
-  const token = process.env.META_ACCESS_TOKEN;
+async function _enviarPeticionMeta(data, meta = {}, cred = null) {
+  // cred = { phoneNumberId, token } del usuario que envía. Sin cred se usan las del .env.
+  const phoneNumberId = cred ? cred.phoneNumberId : process.env.META_PHONE_NUMBER_ID;
+  const token = cred ? cred.token : process.env.META_ACCESS_TOKEN;
 
   if (!phoneNumberId || !token) {
     throw new Error('Faltan las credenciales META_PHONE_NUMBER_ID o META_ACCESS_TOKEN en las variables de entorno.');
@@ -84,7 +85,7 @@ function _limpiarNumero(numero) {
 // MÉTODOS PÚBLICOS DE ENVÍO
 // ==========================================
 
-async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [], templateName, languageCode = 'es_AR') {
+async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [], templateName, languageCode = 'es_AR', cred = null) {
   const cleanNumber = _limpiarNumero(numeroDestino);
   const nombrePlantilla = templateName;
 
@@ -165,10 +166,10 @@ async function enviarPlantillaWhatsApp(numeroDestino, componentesOParametros = [
     to: cleanNumber,
     type: 'template',
     template: templatePayload
-  }, { numeroDestino: cleanNumber, tipo: 'template', templateName: nombrePlantilla });
+  }, { numeroDestino: cleanNumber, tipo: 'template', templateName: nombrePlantilla }, cred);
 }
 
-async function enviarTextoLibreWhatsApp(numeroDestino, texto, contextMessageId = null) {
+async function enviarTextoLibreWhatsApp(numeroDestino, texto, contextMessageId = null, cred = null) {
   const cleanNumber = _limpiarNumero(numeroDestino);
 
   const payload = {
@@ -185,10 +186,10 @@ async function enviarTextoLibreWhatsApp(numeroDestino, texto, contextMessageId =
     };
   }
 
-  return await _enviarPeticionMeta(payload, { numeroDestino: cleanNumber, tipo: 'text' });
+  return await _enviarPeticionMeta(payload, { numeroDestino: cleanNumber, tipo: 'text' }, cred);
 }
 
-async function enviarImagenWhatsApp(numeroDestino, linkUrl, caption = '') {
+async function enviarImagenWhatsApp(numeroDestino, linkUrl, caption = '', cred = null) {
   const cleanNumber = _limpiarNumero(numeroDestino);
 
   return await _enviarPeticionMeta({
@@ -200,10 +201,10 @@ async function enviarImagenWhatsApp(numeroDestino, linkUrl, caption = '') {
       link: linkUrl,
       ...(caption && { caption })
     }
-  }, { numeroDestino: cleanNumber, tipo: 'image' });
+  }, { numeroDestino: cleanNumber, tipo: 'image' }, cred);
 }
 
-async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'documento.pdf', caption = '') {
+async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'documento.pdf', caption = '', cred = null) {
   const cleanNumber = _limpiarNumero(numeroDestino);
 
   return await _enviarPeticionMeta({
@@ -216,7 +217,7 @@ async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'docum
       filename: filename,
       ...(caption && { caption })
     }
-  }, { numeroDestino: cleanNumber, tipo: 'document' });
+  }, { numeroDestino: cleanNumber, tipo: 'document' }, cred);
 }
 
 // ==========================================
@@ -224,8 +225,8 @@ async function enviarDocumentoWhatsApp(numeroDestino, linkUrl, filename = 'docum
 // ==========================================
 
  // Descarga el archivo de medios de Meta y lo sube directamente al Bucket 'whatsapp-media' de Supabase Storage.
-async function descargarMediaWhatsApp(mediaId, mimeTypeEntrante = null) {
-  const token = process.env.META_ACCESS_TOKEN;
+async function descargarMediaWhatsApp(mediaId, mimeTypeEntrante = null, cred = null) {
+  const token = (cred && cred.token) || process.env.META_ACCESS_TOKEN;
 
   if (!token) {
     throw new Error('Falta la credencial META_ACCESS_TOKEN en las variables de entorno.');

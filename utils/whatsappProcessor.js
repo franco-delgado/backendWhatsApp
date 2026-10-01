@@ -18,6 +18,9 @@ async function procesarEnvio(payload = {}) {
   const languageCode =
     payload.languageCode || payload.language_code || "es_AR";
 
+  // Credenciales de Meta del usuario que envía (las pone el servidor, nunca el cliente).
+  const cred = payload.credenciales || null;
+
   if (!number) {
     throw new Error("El parámetro 'number' (o 'to') es obligatorio.");
   }
@@ -36,7 +39,8 @@ async function procesarEnvio(payload = {}) {
         number,
         parameters,
         templateName,
-        languageCode
+        languageCode,
+        cred
       );
     }
 
@@ -48,14 +52,14 @@ async function procesarEnvio(payload = {}) {
       }
       const contextMessageId =
         payload.contextMessageId || payload.context_message_id || null;
-      return await enviarTextoLibreWhatsApp(number, payload.text, contextMessageId);
+      return await enviarTextoLibreWhatsApp(number, payload.text, contextMessageId, cred);
     }
 
     case "image": {
       if (!payload.mediaUrl) {
         throw new Error("Para tipo 'image', el campo 'mediaUrl' es obligatorio.");
       }
-      return await enviarImagenWhatsApp(number, payload.mediaUrl, payload.caption || "");
+      return await enviarImagenWhatsApp(number, payload.mediaUrl, payload.caption || "", cred);
     }
 
     case "document": {
@@ -66,7 +70,8 @@ async function procesarEnvio(payload = {}) {
         number,
         payload.mediaUrl,
         payload.filename || "archivo.pdf",
-        payload.caption || ""
+        payload.caption || "",
+        cred
       );
     }
 

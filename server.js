@@ -9,6 +9,8 @@ const { procesarEnvio } = require("./utils/whatsappProcessor");
 const { responderConIA } = require("./utils/aiAgent");
 const push = require("./utils/pushService");
 const { pausarIA, iaPausadaHasta, reanudarIA, listarPausasActivas, MINUTOS_POR_DEFECTO } = require("./utils/pausaIA");
+const { requireAuth, requireAdmin, usuarioObjetivo } = require("./utils/auth");
+const usuarios = require("./utils/usuarios");
 
 // Interruptor general del agente de IA. Poné AI_AUTORESPONDER=false en
 // Render (Environment) si alguna vez necesitás apagarlo sin tocar código.
@@ -17,6 +19,10 @@ const AI_AUTORESPONDER_ACTIVO =
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Render (y cualquier proxy) antepone su IP: sin esto, el freno a intentos de
+// login vería siempre la misma IP para todo el mundo.
+app.set("trust proxy", 1);
 
 console.log("✅ Cliente de Supabase inicializado");
 
@@ -55,6 +61,9 @@ app.use((req, res, next) => {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Login, sesión y administración de usuarios.
+app.use(require("./rutasAuth"));
+
 // =========================================================================
 // SALUD Y DIAGNÓSTICO
 // =========================================================================
@@ -69,7 +78,7 @@ app.get("/status", (req, res) => {
 
 // Abrí https://TU-BACKEND/api/diag en el navegador: te dice exactamente
 // qué pieza está rota sin tener que leer logs.
-app.get("/api/diag", async (req, res) => {
+app.get("/api/diag", requireAuth, requireAdmin, async (req, res) => {
   const diag = {
     env: {
       SUPABASE_URL: Boolean(process.env.SUPABASE_URL),
@@ -116,11 +125,14 @@ app.get("/api/diag", async (req, res) => {
 // ENDPOINTS DE MENSAJES (API REST)
 // =========================================================================
 
-app.get("/api/mensajes", async (req, res) => {
+app.get("/api/mensajes", requireAuth, async (req, res) => {
   try {
+    // Cada usuario ve SOLO sus mensajes. El admin puede pedir los de otro con ?userId=
+    const userId = usuarioObjetivo(req);
     const { data: mensajes, error } = await supabase
       .from("messages")
       .select("*")
+      .eq("user_id", userId)
       .order("created_at", { ascending: true });
 
     if (error) {
@@ -155,6 +167,7 @@ app.get("/api/mensajes", async (req, res) => {
       data: mensajesFormateados,
     });
   } catch (err) {
+    if (err.status === 403) return res.status(403).json({ success: false, error: err.message });
     console.error("❌ EXCEPCIÓN DE SERVIDOR:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -171,7 +184,7 @@ function extraerNombre(sender) {
   return m ? m[1].trim() : String(sender || "");
 }
 
-app.delete("/api/mensajes/:id", async (req, res) => {
+app.delete("/api/mensajes/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     console.log(`[DELETE] Solicitud para eliminar mensaje ID: ${id}`);
@@ -180,6 +193,7 @@ app.delete("/api/mensajes/:id", async (req, res) => {
       .from("messages")
       .delete()
       .eq("id", id)
+      .eq("user_id", req.user.id) // solo se pueden borrar mensajes propios
       .select();
 
     if (error) throw error;
@@ -200,16 +214,16 @@ app.delete("/api/mensajes/:id", async (req, res) => {
   }
 });
 
-app.delete("/api/mensajes", async (req, res) => {
+app.delete("/api/mensajes", requireAuth, async (req, res) => {
   try {
     const { error } = await supabase
       .from("messages")
       .delete()
-      .neq("sender", "___DUMMY_FILTER___");
+      .eq("user_id", req.user.id); // solo el historial del usuario que lo pide
 
     if (error) throw error;
 
-    res.json({ success: true, message: "Historial de mensajes limpiado de Supabase." });
+    res.json({ success: true, message: "Tu historial de mensajes fue eliminado." });
   } catch (error) {
     console.error("[Servidor] Error al vaciar historial de Supabase:", error.message);
     res.status(500).json({ success: false, error: "Error al limpiar historial." });
@@ -218,17 +232,19 @@ app.delete("/api/mensajes", async (req, res) => {
 
 // Usada tanto por el endpoint manual como por el agente de IA: manda el
 // mensaje por WhatsApp y lo deja guardado en Supabase como "Soporte (numero)".
-async function enviarRespuestaSoporte(numeroLimpio, texto, contextMessageId = null) {
+async function enviarRespuestaSoporte(usuario, numeroLimpio, texto, contextMessageId = null) {
   const result = await procesarEnvio({
     to: numeroLimpio,
     type: "text",
     text: texto,
     contextMessageId,
+    credenciales: usuarios.credencialesMeta(usuario), // envía desde el número de ESTE usuario
   });
 
   const respuestaId = result?.messages?.[0]?.id || `out_${Date.now()}`;
 
   const registro = {
+    user_id: usuario.id,
     sender: `Soporte (${numeroLimpio})`,
     body: texto,
     media_url: null,
@@ -256,7 +272,7 @@ async function enviarRespuestaSoporte(numeroLimpio, texto, contextMessageId = nu
   return result;
 }
 
-app.post("/api/mensajes/responder", async (req, res) => {
+app.post("/api/mensajes/responder", requireAuth, async (req, res) => {
   try {
     const { to, number, messageText, text, contextMessageId } = req.body || {};
     const destinatario = to || number;
@@ -271,12 +287,12 @@ app.post("/api/mensajes/responder", async (req, res) => {
     }
 
     const numeroLimpio = String(destinatario).replace(/\D/g, "");
-    const result = await enviarRespuestaSoporte(numeroLimpio, mensaje, contextMessageId || null);
+    const result = await enviarRespuestaSoporte(req.user, numeroLimpio, mensaje, contextMessageId || null);
 
     // Contestaste vos a mano: el bot se calla un rato para no pisar la charla.
     // Cada respuesta manual renueva el plazo. Se pausa DESPUÉS de enviar, así
     // si el envío falla (ej. error 131047) el bot no queda apagado en vano.
-    const pausadaHasta = await pausarIA(numeroLimpio);
+    const pausadaHasta = await pausarIA(req.user.id, numeroLimpio);
 
     res.json({
       success: true,
@@ -292,14 +308,18 @@ app.post("/api/mensajes/responder", async (req, res) => {
 });
 
 // Estado de las pausas vigentes (lo consulta el frontend para mostrar "🤖 pausado").
-app.get("/api/ia/pausas", async (req, res) => {
-  const pausas = await listarPausasActivas();
-  res.json({ success: true, minutosPorDefecto: MINUTOS_POR_DEFECTO, data: pausas });
+app.get("/api/ia/pausas", requireAuth, async (req, res) => {
+  try {
+    const pausas = await listarPausasActivas(usuarioObjetivo(req));
+    res.json({ success: true, minutosPorDefecto: MINUTOS_POR_DEFECTO, data: pausas });
+  } catch (err) {
+    res.status(err.status || 500).json({ success: false, error: err.message });
+  }
 });
 
 // Reactivar el bot antes de que se cumpla la hora.
-app.delete("/api/ia/pausas/:numero", async (req, res) => {
-  await reanudarIA(req.params.numero);
+app.delete("/api/ia/pausas/:numero", requireAuth, async (req, res) => {
+  await reanudarIA(req.user.id, req.params.numero);
   res.json({ success: true, message: "Bot reactivado para este contacto." });
 });
 
@@ -315,9 +335,9 @@ app.get("/api/push/public-key", (req, res) => {
   res.json({ success: true, publicKey: push.VAPID_PUBLIC_KEY });
 });
 
-app.post("/api/push/subscribe", async (req, res) => {
+app.post("/api/push/subscribe", requireAuth, async (req, res) => {
   try {
-    await push.guardarSuscripcion(req.body);
+    await push.guardarSuscripcion(req.body, req.user.id);
     res.json({ success: true });
   } catch (err) {
     console.error("[Push] subscribe:", err.message);
@@ -325,9 +345,9 @@ app.post("/api/push/subscribe", async (req, res) => {
   }
 });
 
-app.post("/api/push/unsubscribe", async (req, res) => {
+app.post("/api/push/unsubscribe", requireAuth, async (req, res) => {
   try {
-    await push.eliminarSuscripcion(req.body?.endpoint);
+    await push.eliminarSuscripcion(req.body?.endpoint, req.user.id);
     res.json({ success: true });
   } catch (err) {
     console.error("[Push] unsubscribe:", err.message);
@@ -336,7 +356,7 @@ app.post("/api/push/unsubscribe", async (req, res) => {
 });
 
 // Manda una notificación de prueba SOLO al dispositivo que la pide.
-app.post("/api/push/test", async (req, res) => {
+app.post("/api/push/test", requireAuth, async (req, res) => {
   try {
     const { endpoint } = req.body || {};
     if (!endpoint) {
@@ -350,7 +370,7 @@ app.post("/api/push/test", async (req, res) => {
         url: "/",
         siempre: true, // se muestra aunque la app esté abierta
       },
-      endpoint
+      { userId: req.user.id, endpoint }
     );
     res.json({ success: true, ...resultado });
   } catch (err) {
@@ -381,7 +401,9 @@ app.get("/webhook", (req, res) => {
   res.sendStatus(403);
 });
 
-async function procesarMensajeEntrante(msg, contactName) {
+async function procesarMensajeEntrante(msg, contactName, usuario) {
+  // Token con el que se descargan los adjuntos (el propio del usuario o el del .env).
+  const cred = { token: usuario.meta_access_token || undefined };
   let textoMensaje = "";
   let mediaUrl = null;
   let mimeType = "text/plain";
@@ -400,19 +422,19 @@ async function procesarMensajeEntrante(msg, contactName) {
       const mediaData = msg.image || msg.sticker;
       textoMensaje = mediaData?.caption || "";
       mimeType = mediaData?.mime_type || "image/jpeg";
-      if (mediaData?.id) mediaUrl = await descargarMediaWhatsApp(mediaData.id, mimeType);
+      if (mediaData?.id) mediaUrl = await descargarMediaWhatsApp(mediaData.id, mimeType, cred);
     } else if (["audio", "voice"].includes(msg.type)) {
       const mediaData = msg.audio || msg.voice;
       mimeType = mediaData?.mime_type || "audio/ogg";
-      if (mediaData?.id) mediaUrl = await descargarMediaWhatsApp(mediaData.id, mimeType);
+      if (mediaData?.id) mediaUrl = await descargarMediaWhatsApp(mediaData.id, mimeType, cred);
     } else if (msg.type === "document" && msg.document?.id) {
       textoMensaje = msg.document?.caption || msg.document?.filename || "";
       mimeType = msg.document?.mime_type || "application/pdf";
-      mediaUrl = await descargarMediaWhatsApp(msg.document.id, mimeType);
+      mediaUrl = await descargarMediaWhatsApp(msg.document.id, mimeType, cred);
     } else if (msg.type === "video" && msg.video?.id) {
       textoMensaje = msg.video?.caption || "";
       mimeType = msg.video?.mime_type || "video/mp4";
-      mediaUrl = await descargarMediaWhatsApp(msg.video.id, mimeType);
+      mediaUrl = await descargarMediaWhatsApp(msg.video.id, mimeType, cred);
     } else {
       textoMensaje = `[Mensaje de tipo: ${msg.type}]`;
     }
@@ -429,6 +451,7 @@ async function procesarMensajeEntrante(msg, contactName) {
   try {
     const { error: sbErr } = await supabase.from("messages").insert([
       {
+        user_id: usuario.id,
         sender: `${contactName} (${numeroLimpio})`,
         body: textoMensaje,
         media_url: mediaUrl,
@@ -448,16 +471,17 @@ async function procesarMensajeEntrante(msg, contactName) {
   // Notificación push al celular/PC. Sin await a propósito: no debe demorar
   // la respuesta automática de la IA ni el 200 hacia Meta.
   push
-    .notificarMensajeNuevo({ msg, contactName, numero: numeroLimpio, texto: textoMensaje })
+    .notificarMensajeNuevo({ msg, contactName, numero: numeroLimpio, texto: textoMensaje, userId: usuario.id })
     .catch((e) => console.error("[Push] Error notificando:", e.message));
 
   // Agente de IA: solo para mensajes de texto con contenido real. Los
   // audios/imágenes se guardan igual arriba, pero no disparan respuesta
   // automática (Gemini no "ve" el archivo en este flujo).
-  if (AI_AUTORESPONDER_ACTIVO && msg.type === "text" && textoMensaje.trim()) {
+  // El bot solo responde para usuarios con ia_activa (el prompt es de Farmanor Pay).
+  if (AI_AUTORESPONDER_ACTIVO && usuario.ia_activa && msg.type === "text" && textoMensaje.trim()) {
     try {
       // Si contestaste vos hace poco, el bot no interviene.
-      const pausaInicial = await iaPausadaHasta(numeroLimpio);
+      const pausaInicial = await iaPausadaHasta(usuario.id, numeroLimpio);
       if (pausaInicial) {
         console.log(
           `🤖⏸️ IA pausada para ${numeroLimpio} hasta ${pausaInicial.toISOString()}. No se responde.`
@@ -465,12 +489,12 @@ async function procesarMensajeEntrante(msg, contactName) {
         return;
       }
 
-      const historial = await obtenerHistorialParaIA(numeroLimpio);
+      const historial = await obtenerHistorialParaIA(usuario.id, numeroLimpio);
       const respuestaIA = await responderConIA(textoMensaje, historial);
 
       // Gemini puede tardar varios segundos: si mientras tanto contestaste
       // vos a mano, se descarta la respuesta del bot para no pisarte.
-      const pausaTardia = await iaPausadaHasta(numeroLimpio);
+      const pausaTardia = await iaPausadaHasta(usuario.id, numeroLimpio);
       if (pausaTardia) {
         console.log(
           `🤖⏸️ Contestaste a ${numeroLimpio} mientras la IA pensaba. Se descarta su respuesta.`
@@ -479,7 +503,7 @@ async function procesarMensajeEntrante(msg, contactName) {
       }
 
       if (respuestaIA && respuestaIA.trim()) {
-        await enviarRespuestaSoporte(numeroLimpio, respuestaIA.trim());
+        await enviarRespuestaSoporte(usuario, numeroLimpio, respuestaIA.trim());
         console.log(`🤖 Respuesta de IA enviada a ${numeroLimpio}.`);
       } else {
         console.warn(`🤖 La IA no devolvió texto para ${numeroLimpio}, no se envía nada.`);
@@ -495,10 +519,11 @@ async function procesarMensajeEntrante(msg, contactName) {
 // Se llama DESPUÉS de guardar el mensaje entrante, así que el más reciente
 // del resultado ES ese mismo mensaje: se descarta acá porque aiAgent.js ya
 // lo recibe aparte como "mensajeActual" (si no, quedaría duplicado).
-async function obtenerHistorialParaIA(numeroLimpio, limite = 10) {
+async function obtenerHistorialParaIA(userId, numeroLimpio, limite = 10) {
   const { data, error } = await supabase
     .from("messages")
     .select("sender, body, created_at")
+    .eq("user_id", userId)
     .ilike("sender", `%(${numeroLimpio})`)
     .order("created_at", { ascending: false })
     .limit(limite + 1);
@@ -566,6 +591,15 @@ app.post("/webhook", (req, res) => {
         }
 
         if (Array.isArray(value?.messages)) {
+          // ¿A cuál de tus usuarios le escribieron? Se decide por el número de
+          // WhatsApp de destino (metadata.phone_number_id). Si no está asignado
+          // a nadie, lo recibe el administrador.
+          const duenio = await usuarios.resolverDuenioWebhook(value?.metadata?.phone_number_id);
+          if (!duenio) {
+            console.error("[Webhook] No se pudo determinar el usuario dueño del mensaje. Se descarta.");
+            continue;
+          }
+
           for (const msg of value.messages) {
             if (yaProcesado(msg.id)) {
               console.log(`[Webhook] Duplicado ignorado: ${msg.id}`);
@@ -580,7 +614,7 @@ app.post("/webhook", (req, res) => {
             const contactName = contactObj?.profile?.name || "Desconocido";
 
             // await + catch: nunca más una promesa huérfana.
-            await procesarMensajeEntrante(msg, contactName).catch((e) =>
+            await procesarMensajeEntrante(msg, contactName, duenio).catch((e) =>
               console.error("[procesarMensajeEntrante]:", e.message)
             );
           }
@@ -623,9 +657,13 @@ function coincideNumero(a, b) {
 // ENDPOINTS DE ENVÍO MASIVO / INDIVIDUAL
 // =========================================================================
 
-app.post("/send", async (req, res) => {
+app.post("/send", requireAuth, async (req, res) => {
   try {
-    const result = await procesarEnvio(req.body || {});
+    // `credenciales` va al final: el cliente no puede mandar las suyas para usar otro número.
+    const result = await procesarEnvio({
+      ...(req.body || {}),
+      credenciales: usuarios.credencialesMeta(req.user),
+    });
     res.json({ success: true, message: "Mensaje procesado con éxito.", data: result });
   } catch (err) {
     console.error("[Servidor] Error en /send:", err.message);
@@ -633,7 +671,7 @@ app.post("/send", async (req, res) => {
   }
 });
 
-app.post("/send-bulk", async (req, res) => {
+app.post("/send-bulk", requireAuth, async (req, res) => {
   const { contacts, delayMs = 200 } = req.body || {};
 
   if (!Array.isArray(contacts) || contacts.length === 0) {
@@ -642,11 +680,18 @@ app.post("/send-bulk", async (req, res) => {
       .json({ success: false, error: "Se requiere un arreglo 'contacts' válido." });
   }
 
+  let credenciales;
+  try {
+    credenciales = usuarios.credencialesMeta(req.user);
+  } catch (err) {
+    return res.status(400).json({ success: false, error: err.message });
+  }
+
   const results = [];
   for (let i = 0; i < contacts.length; i++) {
     const contact = contacts[i];
     try {
-      const response = await procesarEnvio(contact);
+      const response = await procesarEnvio({ ...contact, credenciales });
       results.push({ number: contact.number || contact.to, status: "success", response });
     } catch (err) {
       results.push({ number: contact.number || contact.to, status: "error", error: err.message });
@@ -665,4 +710,12 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[Servidor Producción] API corriendo en puerto ${PORT} con Supabase`);
+
+  // Crea el administrador la primera vez y asigna los datos viejos a ese usuario.
+  usuarios.asegurarAdmin().catch((e) =>
+    console.error(
+      "❌ No se pudo preparar el administrador. ¿Ejecutaste usuarios.sql en Supabase? Motivo:",
+      e.message
+    )
+  );
 });

@@ -34,23 +34,23 @@ function suscripcionValida(sub) {
   );
 }
 
-async function guardarSuscripcion(sub) {
+async function guardarSuscripcion(sub, userId) {
   if (!suscripcionValida(sub)) throw new Error("Suscripción push inválida.");
   const { error } = await supabase
     .from("push_subscriptions")
     .upsert(
-      [{ endpoint: sub.endpoint, subscription: sub }],
+      [{ endpoint: sub.endpoint, subscription: sub, user_id: userId }],
       { onConflict: "endpoint" }
     );
   if (error) throw new Error(error.message);
 }
 
-async function eliminarSuscripcion(endpoint) {
+// Si se pasa userId, solo borra la suscripción si es de ese usuario.
+async function eliminarSuscripcion(endpoint, userId = null) {
   if (!endpoint) return;
-  const { error } = await supabase
-    .from("push_subscriptions")
-    .delete()
-    .eq("endpoint", endpoint);
+  let q = supabase.from("push_subscriptions").delete().eq("endpoint", endpoint);
+  if (userId) q = q.eq("user_id", userId);
+  const { error } = await q;
   if (error) throw new Error(error.message);
 }
 
@@ -76,12 +76,14 @@ async function enviarUna(sub, payload) {
   }
 }
 
-// Envía a todos los dispositivos suscriptos, o solo a `soloEndpoint` (prueba).
-async function enviarPush(payload, soloEndpoint = null) {
+// Envía a los dispositivos del usuario `userId` (o solo a uno, para la prueba).
+// userId es obligatorio: nunca se avisa a dispositivos de otro usuario.
+async function enviarPush(payload, { userId, endpoint = null } = {}) {
   if (!pushActivo) return { enviados: 0, fallidos: 0, motivo: "push desactivado" };
+  if (!userId) return { enviados: 0, fallidos: 0, motivo: "falta userId" };
 
-  let query = supabase.from("push_subscriptions").select("subscription");
-  if (soloEndpoint) query = query.eq("endpoint", soloEndpoint);
+  let query = supabase.from("push_subscriptions").select("subscription").eq("user_id", userId);
+  if (endpoint) query = query.eq("endpoint", endpoint);
 
   const { data, error } = await query;
   if (error) throw new Error(error.message);
@@ -112,8 +114,9 @@ function previewMensaje(msg, texto) {
   }
 }
 
-async function notificarMensajeNuevo({ msg, contactName, numero, texto }) {
-  const resultado = await enviarPush({
+async function notificarMensajeNuevo({ msg, contactName, numero, texto, userId }) {
+  const resultado = await enviarPush(
+    {
     title: contactName || numero,
     body: previewMensaje(msg, texto),
     numero,
@@ -121,7 +124,9 @@ async function notificarMensajeNuevo({ msg, contactName, numero, texto }) {
     // notificación en vez de apilar 20, pero cada uno vuelve a sonar (renotify).
     tag: `chat-${numero}`,
     url: `/?chat=${numero}`,
-  });
+    },
+    { userId }
+  );
   console.log(`🔔 Push por mensaje de ${numero}:`, JSON.stringify(resultado));
 }
 
