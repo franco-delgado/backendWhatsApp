@@ -12,6 +12,7 @@ const { pausarIA, iaPausadaHasta, reanudarIA, listarPausasActivas, MINUTOS_POR_D
 const { requireAuth, requireAdmin, usuarioObjetivo } = require("./utils/auth");
 const usuarios = require("./utils/usuarios");
 const contactos = require("./utils/contactos");
+const botDeuda = require("./utils/botDeuda");
 
 // Interruptor general del agente de IA. Poné AI_AUTORESPONDER=false en
 // Render (Environment) si alguna vez necesitás apagarlo sin tocar código.
@@ -64,6 +65,9 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Login, sesión y administración de usuarios.
 app.use(require("./rutasAuth"));
+
+// Agenda de clientes (nombre, apellido, DNI, teléfono, monto).
+app.use(require("./rutasClientes"));
 
 // =========================================================================
 // SALUD Y DIAGNÓSTICO
@@ -601,8 +605,24 @@ async function procesarMensajeEntrante(msg, contactName, usuario, compartido = f
         return;
       }
 
-      const historial = await obtenerHistorialParaIA(usuario.id, numeroLimpio);
-      const respuestaIA = await responderConIA(textoMensaje, historial);
+      // Consulta de saldo ("¿cuánto debo?"): la resuelve el servidor leyendo la agenda
+      // (pide el DNI, lo limpia, lo compara y responde el total). La IA no interviene.
+      let respuestaIA = await botDeuda.procesar({
+        usuario,
+        numero: numeroLimpio,
+        texto: textoMensaje,
+      });
+
+      if (!respuestaIA) {
+        const historial = await obtenerHistorialParaIA(usuario.id, numeroLimpio);
+        respuestaIA = await responderConIA(textoMensaje, historial);
+
+        // Red de seguridad: si la IA detectó una consulta de saldo que el filtro no
+        // reconoció, avisa con una marca y el servidor pide el DNI.
+        if (respuestaIA && respuestaIA.includes("[[PEDIR_DNI]]")) {
+          respuestaIA = botDeuda.MSG_PEDIR_DNI;
+        }
+      }
 
       // Gemini puede tardar varios segundos: si mientras tanto contestaste
       // vos a mano, se descarta la respuesta del bot para no pisarte.
