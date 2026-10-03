@@ -38,6 +38,16 @@ router.post("/api/clientes/importar", requireAuth, async (req, res) => {
   }
 });
 
+// Carga masiva desde Excel: { filas: [{ fila, nombre, apellido, dni, numero, monto }] }
+router.post("/api/clientes/importar-excel", requireAuth, async (req, res) => {
+  try {
+    const data = await clientes.importarFilas(req.user.id, req.body?.filas);
+    res.json({ success: true, ...data });
+  } catch (e) {
+    responderError(res, e, "importar-excel");
+  }
+});
+
 router.put("/api/clientes/:id", requireAuth, async (req, res) => {
   try {
     const data = await clientes.actualizar(req.user.id, req.params.id, req.body);
