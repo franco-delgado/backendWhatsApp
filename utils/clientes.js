@@ -154,6 +154,58 @@ async function importar(userId, lista) {
   return { importados: filas.length, omitidos };
 }
 
+// Importación desde Excel. Recibe filas ya leídas por el frontend:
+//   [{ fila, nombre, apellido, dni, numero, monto }]   (`fila` = número de fila en el Excel)
+// Valida cada fila, salta duplicados (teléfono o DNI ya cargados, o repetidos dentro del
+// mismo archivo) y devuelve el detalle de lo que no se pudo cargar, con su número de fila.
+// Repetirlo no duplica nada.
+async function importarFilas(userId, filas) {
+  if (!Array.isArray(filas)) throw httpError(400, "Se esperaba una lista de filas.");
+  if (filas.length > 5000) throw httpError(400, "Máximo 5000 filas por archivo.");
+
+  const existentes = await listar(userId);
+  const telefonos = new Set(existentes.map((c) => c.numero.slice(-10)));
+  const dnis = new Set(existentes.map((c) => c.dni).filter(Boolean));
+
+  const errores = [];
+  const validas = []; // { fila, datos }
+  for (const f of filas) {
+    const nroFila = f?.fila ?? "?";
+    try {
+      const datos = normalizar({ ...f, monto: f.monto ?? 0 });
+      const k = datos.numero.slice(-10);
+      if (telefonos.has(k)) throw httpError(409, "Teléfono repetido (ya está cargado).");
+      if (datos.dni && dnis.has(datos.dni)) throw httpError(409, "DNI repetido (ya está cargado).");
+      telefonos.add(k);
+      if (datos.dni) dnis.add(datos.dni);
+      validas.push({ fila: nroFila, datos: { ...datos, user_id: userId, alta: false } });
+    } catch (e) {
+      errores.push({ fila: nroFila, motivo: e.message });
+    }
+  }
+
+  // Inserta de a 500. Si un bloque falla (p. ej. restricción única en la base),
+  // reintenta fila por fila para saber cuál fue y no perder el resto.
+  let importados = 0;
+  const TAM = 500;
+  for (let i = 0; i < validas.length; i += TAM) {
+    const bloque = validas.slice(i, i + TAM);
+    const { error } = await supabase.from("clientes").insert(bloque.map((v) => v.datos));
+    if (!error) {
+      importados += bloque.length;
+      continue;
+    }
+    for (const v of bloque) {
+      const r = await supabase.from("clientes").insert([v.datos]);
+      if (r.error) errores.push({ fila: v.fila, motivo: traducir(r.error).message });
+      else importados++;
+    }
+  }
+
+  errores.sort((a, b) => Number(a.fila) - Number(b.fila));
+  return { importados, omitidos: errores.length, errores };
+}
+
 // Busca un cliente por DNI (comparando solo dígitos). Devuelve null si no existe.
 // Un usuario busca en SU agenda; el administrador, si no lo encuentra en la suya,
 // busca en la de todos (los clientes que escriben por su cuenta le llegan a él).
@@ -187,5 +239,6 @@ module.exports = {
   actualizar,
   eliminar,
   importar,
+  importarFilas,
   buscarPorDni,
 };
