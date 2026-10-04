@@ -12,6 +12,7 @@ const { pausarIA, iaPausadaHasta, reanudarIA, listarPausasActivas, MINUTOS_POR_D
 const { requireAuth, requireAdmin, usuarioObjetivo } = require("./utils/auth");
 const usuarios = require("./utils/usuarios");
 const contactos = require("./utils/contactos");
+const agenda = require("./utils/clientes");
 const botDeuda = require("./utils/botDeuda");
 
 // Interruptor general del agente de IA. Poné AI_AUTORESPONDER=false en
@@ -811,6 +812,12 @@ app.post("/send", requireAuth, async (req, res) => {
         console.warn("[Contactos] No se pudo registrar el dueño del contacto:", e.message)
       );
     }
+    // Plantilla de invitación enviada: queda marcado el cliente para no confundirlo con los no invitados.
+    if (body.marcarInvitacion) {
+      await agenda.marcarInvitado(req.user.id, destino).catch((e) =>
+        console.warn("[Agenda] No se pudo marcar al cliente como invitado:", e.message)
+      );
+    }
     res.json({ success: true, message: "Mensaje procesado con éxito.", data: result });
   } catch (err) {
     console.error("[Servidor] Error en /send:", err.message);
@@ -847,6 +854,12 @@ app.post("/send-bulk", requireAuth, async (req, res) => {
       if (credenciales.compartido) {
         await contactos.reclamarSiLibre(req.user, destino).catch((e) =>
           console.warn("[Contactos] No se pudo registrar el dueño del contacto:", e.message)
+        );
+      }
+      // Solo se marca si el envío salió bien (si falla, sigue figurando como "sin invitar").
+      if (contact.marcarInvitacion) {
+        await agenda.marcarInvitado(req.user.id, destino).catch((e) =>
+          console.warn("[Agenda] No se pudo marcar al cliente como invitado:", e.message)
         );
       }
       results.push({ number: destino, status: "success", response });

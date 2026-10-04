@@ -25,6 +25,9 @@ function traducir(e) {
   }
   if (e.code === "23505") return httpError(409, "Ya existe un cliente con ese DNI.");
   if (e.code === "23514") return httpError(400, "Datos inválidos (revisá DNI y monto).");
+  if (e.code === "42703" || e.code === "PGRST204") {
+    return httpError(500, "Faltan las columnas de invitación. Ejecutá invitaciones.sql en Supabase > SQL Editor.");
+  }
   return e;
 }
 
@@ -38,6 +41,8 @@ const aApi = (r) => ({
   monto: Number(r.monto) || 0,
   alta: Boolean(r.alta),
   fechaAlta: r.fecha_alta || null,
+  invitado: Boolean(r.invitado), // ya se le envió la plantilla de invitación
+  fechaInvitacion: r.fecha_invitacion || null,
   usuario_id: r.user_id,
 });
 
@@ -221,6 +226,22 @@ async function importarFilas(userId, filas) {
   return { importados, omitidos: errores.length, errores };
 }
 
+// Marca como "invitado" al cliente (de este usuario) al que se le envió la plantilla de invitación.
+// Compara por los últimos 10 dígitos (549XXXXXXXXXX y 54XXXXXXXXXX son el mismo celular).
+// Devuelve cuántos clientes se marcaron.
+async function marcarInvitado(userId, numero) {
+  const k = limpiarNumero(numero).slice(-10);
+  if (k.length < 8) return 0;
+  const { data, error } = await supabase
+    .from("clientes")
+    .update({ invitado: true, fecha_invitacion: new Date().toISOString() })
+    .eq("user_id", userId)
+    .like("numero", `%${k}`)
+    .select("id");
+  if (error) throw traducir(error);
+  return data?.length || 0;
+}
+
 // Busca un cliente por DNI (comparando solo dígitos). Devuelve null si no existe.
 // Un usuario busca en SU agenda; el administrador, si no lo encuentra en la suya,
 // busca en la de todos (los clientes que escriben por su cuenta le llegan a él).
@@ -255,5 +276,6 @@ module.exports = {
   eliminar,
   importar,
   importarFilas,
+  marcarInvitado,
   buscarPorDni,
 };
