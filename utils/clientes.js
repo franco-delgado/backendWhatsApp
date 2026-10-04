@@ -79,12 +79,27 @@ function normalizar(datos = {}, { parcial = false } = {}) {
   return out;
 }
 
+// Supabase devuelve como máximo 1000 filas por consulta (límite por defecto). Se piden
+// de a páginas para traer TODOS los clientes; si no, con más de 1000 contactos los últimos
+// no aparecerían en el buscador ni en la plantilla de cobro.
+const TAMANO_PAGINA = 1000;
+
 async function listar(userId) {
-  let q = supabase.from("clientes").select("*").order("created_at", { ascending: true });
-  if (userId !== "todos") q = q.eq("user_id", userId);
-  const { data, error } = await q;
-  if (error) throw traducir(error);
-  return (data || []).map(aApi);
+  const filas = [];
+  for (let desde = 0; ; desde += TAMANO_PAGINA) {
+    let q = supabase
+      .from("clientes")
+      .select("*")
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true }) // desempate: paginar necesita un orden estable
+      .range(desde, desde + TAMANO_PAGINA - 1);
+    if (userId !== "todos") q = q.eq("user_id", userId);
+    const { data, error } = await q;
+    if (error) throw traducir(error);
+    filas.push(...(data || []));
+    if (!data || data.length < TAMANO_PAGINA) break;
+  }
+  return filas.map(aApi);
 }
 
 async function crear(userId, datos) {
