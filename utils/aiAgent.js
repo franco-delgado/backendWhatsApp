@@ -45,10 +45,11 @@ en esta lista, decile que no manejás esa información):
 3. Foto de algún *comprobante de servicio/impuesto* (por ejemplo ABL, luz, gas, agua)
    cuya dirección coincida con la que figura en el DNI.
 
-BENEFICIOS DE LA CUENTA (son los únicos que existen, no agregues otros):
+BENEFICIOS Y COSTOS DE LA CUENTA (son los únicos que existen, no agregues otros):
 - Hasta *40% de descuento* en medicamentos seleccionados.
 - Descuentos especiales que cambian mes a mes.
 - Descuento del mes actual: productos de la línea *ENA*.
+- Si el cliente pregunta si la cuenta tiene costo de mantenimiento, respondé explicitamente: no tiene costo de mantenimiento, pagas solamente lo que compraste.
 (Este bloque de beneficios es el que hay que actualizar a mano cada vez que
 cambien las promociones del mes; el resto del prompt no cambia.)
 
@@ -70,7 +71,6 @@ interpreta Markdown y el cliente vería los símbolos literales.
 
 Mantené un tono cordial y breve, con emojis ocasionales pero sin saturar.
 `;
-
 // Reintenta ante errores transitorios de Gemini (503 "sobrecargado", 429 "rate limit").
 // Otros errores (API key inválida, etc.) no tiene sentido reintentarlos: se cortan al toque.
 async function llamarConReintentos(payload, intentos = 3) {
@@ -146,6 +146,67 @@ async function responderConIA(mensajeActual, historialPrevio = []) {
   }
 }
 
+// Tamaño máximo de audio que se manda a Gemini (inline). Una nota de voz de WhatsApp
+// pesa unos pocos cientos de KB; esto solo frena archivos enormes.
+const MAX_AUDIO_BYTES = 15 * 1024 * 1024;
+
+const PROMPT_TRANSCRIPCION =
+  "Transcribí textualmente lo que dice la persona en este audio de WhatsApp. " +
+  "Devolvé SOLO la transcripción, sin comillas, sin comentarios y sin traducir. " +
+  "Si dicta números (por ejemplo un DNI), escribilos con dígitos. " +
+  "Si no hay voz o no se entiende nada, devolvé exactamente: [[SIN_VOZ]]";
+
+/**
+ * Escucha un audio y lo transcribe a texto con Gemini.
+ * El texto resultante sigue el mismo camino que un mensaje escrito (botDeuda + IA),
+ * así las reglas del bot se aplican igual a lo que el cliente dice por voz.
+ * @param {Buffer} buffer Contenido del audio.
+ * @param {string} mimeType Ej: "audio/ogg; codecs=opus" (se limpian los parámetros).
+ * @returns {Promise<string|null>} Transcripción, o null si no se pudo / no se entiende.
+ */
+async function transcribirAudio(buffer, mimeType = "audio/ogg") {
+  try {
+    if (!apiKey) {
+      console.error("[IA Audio] Operación cancelada: Falta GEMINI_API_KEY.");
+      return null;
+    }
+    if (!buffer || !buffer.length) return null;
+    if (buffer.length > MAX_AUDIO_BYTES) {
+      console.warn(`[IA Audio] Audio demasiado grande (${buffer.length} bytes). Se omite.`);
+      return null;
+    }
+
+    // "audio/ogg; codecs=opus" -> "audio/ogg" (Gemini no acepta los parámetros)
+    const mime = String(mimeType).split(";")[0].trim() || "audio/ogg";
+
+    const response = await llamarConReintentos({
+      model: "gemini-3.6-flash",
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { inlineData: { mimeType: mime, data: Buffer.from(buffer).toString("base64") } },
+            { text: PROMPT_TRANSCRIPCION },
+          ],
+        },
+      ],
+      config: {
+        temperature: 0,
+        maxOutputTokens: 1024,
+        thinkingConfig: { thinkingBudget: 0 },
+      },
+    });
+
+    const texto = (response.text || "").trim();
+    if (!texto || texto.includes("[[SIN_VOZ]]")) return null;
+    return texto;
+  } catch (error) {
+    console.error("[IA Audio Error]:", error.message);
+    return null;
+  }
+}
+
 module.exports = {
   responderConIA,
+  transcribirAudio,
 };

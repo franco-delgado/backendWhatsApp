@@ -6,7 +6,8 @@ const cors = require("cors");
 const { supabase } = require("./supabaseClient");
 const { descargarMediaWhatsApp, enviarTextoLibreWhatsApp } = require("./whatsappService");
 const { procesarEnvio } = require("./utils/whatsappProcessor");
-const { responderConIA } = require("./utils/aiAgent");
+const { responderConIA, transcribirAudio } = require("./utils/aiAgent");
+const axios = require("axios");
 const push = require("./utils/pushService");
 const { pausarIA, iaPausadaHasta, reanudarIA, listarPausasActivas, MINUTOS_POR_DEFECTO } = require("./utils/pausaIA");
 const { requireAuth, requireAdmin, usuarioObjetivo } = require("./utils/auth");
@@ -516,6 +517,9 @@ async function procesarMensajeEntrante(msg, contactName, usuario, compartido = f
   let textoMensaje = "";
   let mediaUrl = null;
   let mimeType = "text/plain";
+  // Audios: el texto que "escuchó" la IA. Es lo que se usa para responder.
+  const esAudio = ["audio", "voice"].includes(msg.type);
+  let transcripcion = null;
 
   try {
     if (msg.type === "text" && msg.text?.body) {
@@ -536,6 +540,18 @@ async function procesarMensajeEntrante(msg, contactName, usuario, compartido = f
       const mediaData = msg.audio || msg.voice;
       mimeType = mediaData?.mime_type || "audio/ogg";
       if (mediaData?.id) mediaUrl = await descargarMediaWhatsApp(mediaData.id, mimeType, cred);
+
+      // Escuchar el audio: se baja el archivo ya subido a Supabase y Gemini lo transcribe.
+      // Si algo falla acá, el audio igual se guarda (solo que sin transcripción).
+      if (mediaUrl && AI_AUTORESPONDER_ACTIVO) {
+        try {
+          const audioRes = await axios.get(mediaUrl, { responseType: "arraybuffer", timeout: 20000 });
+          transcripcion = await transcribirAudio(Buffer.from(audioRes.data), mimeType);
+          if (transcripcion) textoMensaje = `🎤 ${transcripcion}`;
+        } catch (e) {
+          console.error("[Audio] No se pudo transcribir:", e.message);
+        }
+      }
     } else if (msg.type === "document" && msg.document?.id) {
       textoMensaje = msg.document?.caption || msg.document?.filename || "";
       mimeType = msg.document?.mime_type || "application/pdf";
@@ -590,12 +606,11 @@ async function procesarMensajeEntrante(msg, contactName, usuario, compartido = f
     .notificarMensajeNuevo({ msg, contactName, numero: numeroLimpio, texto: textoMensaje, userId: usuario.id })
     .catch((e) => console.error("[Push] Error notificando:", e.message));
 
-  // Agente de IA: solo para mensajes de texto con contenido real. Los
-  // audios/imágenes se guardan igual arriba, pero no disparan respuesta
-  // automática (Gemini no "ve" el archivo en este flujo).
+  // Agente de IA: responde a mensajes de texto y a audios (que se transcriben arriba).
+  // Las imágenes/documentos se guardan igual, pero no disparan respuesta automática.
   // El bot solo responde si: el usuario está activo, el admin no se lo bloqueó (ia_permitida)
   // y el propio usuario lo tiene encendido (ia_activa).
-  if (AI_AUTORESPONDER_ACTIVO && usuario.activo && usuario.ia_permitida !== false && usuario.ia_activa && msg.type === "text" && textoMensaje.trim()) {
+  if (AI_AUTORESPONDER_ACTIVO && usuario.activo && usuario.ia_permitida !== false && usuario.ia_activa && ((msg.type === "text" && textoMensaje.trim()) || esAudio)) {
     try {
       // Si contestaste vos hace poco, el bot no interviene.
       const pausaInicial = await iaPausadaHasta(usuario.id, numeroLimpio);
@@ -608,15 +623,24 @@ async function procesarMensajeEntrante(msg, contactName, usuario, compartido = f
 
       // Consulta de saldo ("¿cuánto debo?"): la resuelve el servidor leyendo la agenda
       // (pide el DNI, lo limpia, lo compara y responde el total). La IA no interviene.
-      let respuestaIA = await botDeuda.procesar({
-        usuario,
-        numero: numeroLimpio,
-        texto: textoMensaje,
-      });
+      // Para un audio, el "mensaje" es lo que se le entendió al cliente.
+      const textoParaIA = esAudio ? transcripcion || "" : textoMensaje;
+
+      let respuestaIA = null;
+      if (esAudio && !textoParaIA.trim()) {
+        // No se pudo entender el audio: se le pide que lo repita o lo escriba.
+        respuestaIA = "No pude escuchar bien tu audio 😕 ¿Podés enviarlo de nuevo o escribirme tu consulta?";
+      } else {
+        respuestaIA = await botDeuda.procesar({
+          usuario,
+          numero: numeroLimpio,
+          texto: textoParaIA,
+        });
+      }
 
       if (!respuestaIA) {
         const historial = await obtenerHistorialParaIA(usuario.id, numeroLimpio);
-        respuestaIA = await responderConIA(textoMensaje, historial);
+        respuestaIA = await responderConIA(textoParaIA, historial);
 
         // Red de seguridad: si la IA detectó una consulta de saldo que el filtro no
         // reconoció, avisa con una marca y el servidor pide el DNI.
