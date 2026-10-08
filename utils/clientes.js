@@ -3,6 +3,7 @@
 // teléfono y monto. El DNI siempre se guarda solo con dígitos.
 const { supabase } = require("../supabaseClient");
 
+const TAMANO_PAGINA = 1000; // Supabase devuelve como máximo 1000 filas por consulta
 const DNI_MIN = 6;
 const DNI_MAX = 8;
 
@@ -23,7 +24,14 @@ function traducir(e) {
   if (e.code === "42P01" || e.code === "PGRST205") {
     return httpError(500, "Falta la tabla de clientes. Ejecutá clientes.sql en Supabase > SQL Editor.");
   }
-  if (e.code === "23505") return httpError(409, "Ya existe un cliente con ese DNI.");
+  if (e.code === "23505") {
+    // La restricción única de la base (clientes_user_tel_uniq / clientes_user_dni_uniq) es la
+    // última barrera si dos altas llegan al mismo tiempo; acá se dice cuál de las dos saltó.
+    const detalle = `${e.message || ""} ${e.details || ""}`;
+    return httpError(409, /tel|numero/i.test(detalle)
+      ? "Ese teléfono ya está agendado."
+      : "Ya existe un cliente con ese DNI.");
+  }
   if (e.code === "23514") return httpError(400, "Datos inválidos (revisá DNI y monto).");
   if (e.code === "42703" || e.code === "PGRST204") {
     return httpError(500, "Faltan las columnas de invitación. Ejecutá invitaciones.sql en Supabase > SQL Editor.");
@@ -84,11 +92,79 @@ function normalizar(datos = {}, { parcial = false } = {}) {
   return out;
 }
 
+// Usuarios de la app: { id -> username }. Son pocos, se leen de una vez.
+async function mapaUsuarios() {
+  const { data, error } = await supabase.from("app_users").select("id, username");
+  if (error) throw traducir(error);
+  return new Map((data || []).map((u) => [u.id, u.username]));
+}
+
+// ¿Ya existe OTRO cliente con ese teléfono o ese DNI?
+//  - TELÉFONO: se busca en la agenda de TODOS los usuarios. Se compara por los últimos
+//    10 dígitos (549XXXXXXXXXX y 54XXXXXXXXXX son el mismo celular). Si lo tiene otro
+//    usuario, el error dice cuál (solo su nombre de usuario, no los datos de su cliente).
+//  - DNI: solo dentro de la agenda del propio usuario.
+// `excluirId` sirve al editar, para no chocar con el propio cliente.
+// Devuelve un Error 409 listo para lanzar, o null si no hay repetido.
+async function buscarDuplicado(userId, { numero, dni }, excluirId = null) {
+  if (numero) {
+    const k = limpiarNumero(numero).slice(-10);
+    let q = supabase
+      .from("clientes")
+      .select("id, nombre, apellido, user_id")
+      .like("numero", `%${k}`)
+      .limit(1);
+    if (excluirId) q = q.neq("id", excluirId);
+    const { data, error } = await q;
+    if (error) throw traducir(error);
+    const dup = data?.[0];
+    if (dup) {
+      if (dup.user_id === userId) {
+        const nombre = `${dup.nombre} ${dup.apellido || ""}`.trim();
+        return httpError(409, `Ya tenés agendado ese teléfono: ${nombre}.`);
+      }
+      const dueno = (await mapaUsuarios()).get(dup.user_id);
+      return httpError(
+        409,
+        dueno
+          ? `Ese teléfono ya está agendado por el usuario "${dueno}".`
+          : "Ese teléfono ya está agendado por otro usuario."
+      );
+    }
+  }
+
+  if (dni) {
+    let q = supabase.from("clientes").select("id, nombre, apellido").eq("user_id", userId).eq("dni", dni).limit(1);
+    if (excluirId) q = q.neq("id", excluirId);
+    const { data, error } = await q;
+    if (error) throw traducir(error);
+    if (data?.[0]) {
+      const nombre = `${data[0].nombre} ${data[0].apellido || ""}`.trim();
+      return httpError(409, `Ya existe un cliente con ese DNI: ${nombre}.`);
+    }
+  }
+  return null;
+}
+
+// Teléfonos de TODA la base: { últimos 10 dígitos -> { id, user_id, monto } }.
+async function telefonosGlobales() {
+  const mapa = new Map();
+  for (let desde = 0; ; desde += TAMANO_PAGINA) {
+    const { data, error } = await supabase
+      .from("clientes")
+      .select("id, numero, user_id, monto")
+      .order("id", { ascending: true })
+      .range(desde, desde + TAMANO_PAGINA - 1);
+    if (error) throw traducir(error);
+    for (const r of data || []) mapa.set(String(r.numero).slice(-10), r);
+    if (!data || data.length < TAMANO_PAGINA) break;
+  }
+  return mapa;
+}
+
 // Supabase devuelve como máximo 1000 filas por consulta (límite por defecto). Se piden
 // de a páginas para traer TODOS los clientes; si no, con más de 1000 contactos los últimos
 // no aparecerían en el buscador ni en la plantilla de cobro.
-const TAMANO_PAGINA = 1000;
-
 async function listar(userId) {
   const filas = [];
   for (let desde = 0; ; desde += TAMANO_PAGINA) {
@@ -109,6 +185,8 @@ async function listar(userId) {
 
 async function crear(userId, datos) {
   const fila = { ...normalizar(datos), user_id: userId };
+  const duplicado = await buscarDuplicado(userId, fila);
+  if (duplicado) throw duplicado;
   const { data, error } = await supabase.from("clientes").insert([fila]).select().single();
   if (error) throw traducir(error);
   return aApi(data);
@@ -116,6 +194,9 @@ async function crear(userId, datos) {
 
 async function actualizar(userId, id, datos) {
   const cambios = { ...normalizar(datos, { parcial: true }), updated_at: new Date().toISOString() };
+  // Solo se revisa lo que realmente se está cambiando (teléfono y/o DNI).
+  const duplicado = await buscarDuplicado(userId, { numero: cambios.numero, dni: cambios.dni }, id);
+  if (duplicado) throw duplicado;
   const { data, error } = await supabase
     .from("clientes")
     .update(cambios)
@@ -139,11 +220,13 @@ async function eliminar(userId, id) {
   if (!data?.length) throw httpError(404, "Cliente no encontrado.");
 }
 
-// Pasa la agenda vieja (localStorage) al servidor. Salta los teléfonos que ya existen,
-// así que repetirlo no duplica nada.
+// Pasa la agenda vieja (localStorage) al servidor. Salta los teléfonos que ya estén
+// agendados (por cualquier usuario) y los DNI repetidos del propio usuario, así que
+// repetirlo no duplica nada.
 async function importar(userId, lista) {
   if (!Array.isArray(lista)) throw httpError(400, "Se esperaba una lista de contactos.");
-  const existentes = new Set((await listar(userId)).map((c) => c.numero.slice(-10)));
+  const telefonos = await telefonosGlobales();
+  const dnis = new Set((await listar(userId)).map((c) => c.dni).filter(Boolean));
 
   const filas = [];
   let omitidos = 0;
@@ -151,11 +234,12 @@ async function importar(userId, lista) {
     try {
       const f = normalizar({ ...c, monto: c.monto ?? 0 });
       const k = f.numero.slice(-10);
-      if (existentes.has(k)) {
+      if (telefonos.has(k) || (f.dni && dnis.has(f.dni))) {
         omitidos++;
         continue;
       }
-      existentes.add(k);
+      telefonos.set(k, { user_id: userId });
+      if (f.dni) dnis.add(f.dni);
       filas.push({
         ...f,
         user_id: userId,
@@ -176,40 +260,69 @@ async function importar(userId, lista) {
 
 // Importación desde Excel. Recibe filas ya leídas por el frontend:
 //   [{ fila, nombre, apellido, dni, numero, monto }]   (`fila` = número de fila en el Excel)
-// Valida cada fila, salta duplicados (teléfono o DNI ya cargados, o repetidos dentro del
-// mismo archivo) y devuelve el detalle de lo que no se pudo cargar, con su número de fila.
-// Repetirlo no duplica nada.
+// Por cada fila:
+//   - Teléfono NUEVO                      -> se crea el cliente.
+//   - Teléfono ya en la agenda del usuario -> se ACTUALIZA el monto a cobrar (el resto del
+//                                            cliente no se toca).
+//   - Teléfono agendado por OTRO usuario   -> no se carga ni se toca; se informa de quién es.
+//   - DNI ya cargado (con otro teléfono) o teléfono repetido dentro del mismo archivo
+//                                          -> no se carga; queda en `errores` con su fila.
+// Devuelve { importados, actualizados, sinCambios, omitidos, errores }.
 async function importarFilas(userId, filas) {
   if (!Array.isArray(filas)) throw httpError(400, "Se esperaba una lista de filas.");
   if (filas.length > 5000) throw httpError(400, "Máximo 5000 filas por archivo.");
 
-  const existentes = await listar(userId);
-  const telefonos = new Set(existentes.map((c) => c.numero.slice(-10)));
-  const dnis = new Set(existentes.map((c) => c.dni).filter(Boolean));
+  const telefonos = await telefonosGlobales(); // todos los usuarios
+  const usuarios = await mapaUsuarios();
+  const propios = await listar(userId);
+  const dnis = new Set(propios.map((c) => c.dni).filter(Boolean));
 
   const errores = [];
-  const validas = []; // { fila, datos }
+  const nuevas = []; // { fila, datos }
+  const aActualizar = []; // { fila, id, monto }
+  const vistos = new Set(); // teléfonos ya procesados en este archivo
+  let sinCambios = 0;
+
   for (const f of filas) {
     const nroFila = f?.fila ?? "?";
     try {
       const datos = normalizar({ ...f, monto: f.monto ?? 0 });
       const k = datos.numero.slice(-10);
-      if (telefonos.has(k)) throw httpError(409, "Teléfono repetido (ya está cargado).");
+
+      if (vistos.has(k)) throw httpError(409, "Teléfono repetido dentro del archivo.");
+      vistos.add(k);
+
+      const existente = telefonos.get(k);
+      if (existente) {
+        if (existente.user_id !== userId) {
+          const dueno = usuarios.get(existente.user_id);
+          throw httpError(
+            409,
+            dueno
+              ? `Teléfono ya agendado por el usuario "${dueno}".`
+              : "Teléfono ya agendado por otro usuario."
+          );
+        }
+        // Ya está en la agenda de este usuario: solo se actualiza el monto.
+        if (Number(existente.monto) === datos.monto) sinCambios++;
+        else aActualizar.push({ fila: nroFila, id: existente.id, monto: datos.monto });
+        continue;
+      }
+
       if (datos.dni && dnis.has(datos.dni)) throw httpError(409, "DNI repetido (ya está cargado).");
-      telefonos.add(k);
       if (datos.dni) dnis.add(datos.dni);
-      validas.push({ fila: nroFila, datos: { ...datos, user_id: userId, alta: false } });
+      nuevas.push({ fila: nroFila, datos: { ...datos, user_id: userId, alta: false } });
     } catch (e) {
       errores.push({ fila: nroFila, motivo: e.message });
     }
   }
 
-  // Inserta de a 500. Si un bloque falla (p. ej. restricción única en la base),
+  // Altas: de a 500. Si un bloque falla (p. ej. restricción única en la base),
   // reintenta fila por fila para saber cuál fue y no perder el resto.
   let importados = 0;
   const TAM = 500;
-  for (let i = 0; i < validas.length; i += TAM) {
-    const bloque = validas.slice(i, i + TAM);
+  for (let i = 0; i < nuevas.length; i += TAM) {
+    const bloque = nuevas.slice(i, i + TAM);
     const { error } = await supabase.from("clientes").insert(bloque.map((v) => v.datos));
     if (!error) {
       importados += bloque.length;
@@ -222,8 +335,25 @@ async function importarFilas(userId, filas) {
     }
   }
 
+  // Actualización de montos: de a 25 en paralelo.
+  let actualizados = 0;
+  const ahora = new Date().toISOString();
+  for (let i = 0; i < aActualizar.length; i += 25) {
+    await Promise.all(
+      aActualizar.slice(i, i + 25).map(async (u) => {
+        const { error } = await supabase
+          .from("clientes")
+          .update({ monto: u.monto, updated_at: ahora })
+          .eq("id", u.id)
+          .eq("user_id", userId); // solo se toca lo propio
+        if (error) errores.push({ fila: u.fila, motivo: traducir(error).message });
+        else actualizados++;
+      })
+    );
+  }
+
   errores.sort((a, b) => Number(a.fila) - Number(b.fila));
-  return { importados, omitidos: errores.length, errores };
+  return { importados, actualizados, sinCambios, omitidos: errores.length, errores };
 }
 
 // Marca como "invitado" al cliente (de este usuario) al que se le envió la plantilla de invitación.
