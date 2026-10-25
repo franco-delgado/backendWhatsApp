@@ -640,7 +640,10 @@ async function procesarMensajeEntrante(msg, contactName, usuario, compartido = f
 
       if (!respuestaIA) {
         const historial = await obtenerHistorialParaIA(usuario.id, numeroLimpio);
-        respuestaIA = await responderConIA(textoParaIA, historial);
+        // ¿Quién escribe? Se lo busca en la agenda por su teléfono (ej. los clientes
+        // cargados desde Excel) para que el bot lo trate como lo que es.
+        const cliente = await agenda.buscarPorTelefono(usuario, numeroLimpio);
+        respuestaIA = await responderConIA(textoParaIA, historial, cliente);
 
         // Red de seguridad: si la IA detectó una consulta de saldo que el filtro no
         // reconoció, avisa con una marca y el servidor pide el DNI.
