@@ -34,7 +34,7 @@ function traducir(e) {
   }
   if (e.code === "23514") return httpError(400, "Datos inválidos (revisá DNI y monto).");
   if (e.code === "42703" || e.code === "PGRST204") {
-    return httpError(500, "Faltan las columnas de invitación. Ejecutá invitaciones.sql en Supabase > SQL Editor.");
+    return httpError(500, "Faltan columnas en la tabla de clientes. Ejecutá clientes.sql en Supabase > SQL Editor.");
   }
   return e;
 }
@@ -218,44 +218,6 @@ async function eliminar(userId, id) {
     .select("id");
   if (error) throw traducir(error);
   if (!data?.length) throw httpError(404, "Cliente no encontrado.");
-}
-
-// Pasa la agenda vieja (localStorage) al servidor. Salta los teléfonos que ya estén
-// agendados (por cualquier usuario) y los DNI repetidos del propio usuario, así que
-// repetirlo no duplica nada.
-async function importar(userId, lista) {
-  if (!Array.isArray(lista)) throw httpError(400, "Se esperaba una lista de contactos.");
-  const telefonos = await telefonosGlobales();
-  const dnis = new Set((await listar(userId)).map((c) => c.dni).filter(Boolean));
-
-  const filas = [];
-  let omitidos = 0;
-  for (const c of lista.slice(0, 5000)) {
-    try {
-      const f = normalizar({ ...c, monto: c.monto ?? 0 });
-      const k = f.numero.slice(-10);
-      if (telefonos.has(k) || (f.dni && dnis.has(f.dni))) {
-        omitidos++;
-        continue;
-      }
-      telefonos.set(k, { user_id: userId });
-      if (f.dni) dnis.add(f.dni);
-      filas.push({
-        ...f,
-        user_id: userId,
-        alta: Boolean(c.alta),
-        fecha_alta: c.alta ? c.fechaAlta || new Date().toISOString() : null,
-      });
-    } catch {
-      omitidos++;
-    }
-  }
-
-  if (filas.length) {
-    const { error } = await supabase.from("clientes").insert(filas);
-    if (error) throw traducir(error);
-  }
-  return { importados: filas.length, omitidos };
 }
 
 // Importación desde Excel. Recibe filas ya leídas por el frontend:
@@ -451,7 +413,6 @@ module.exports = {
   crear,
   actualizar,
   eliminar,
-  importar,
   importarFilas,
   marcarInvitado,
   buscarPorDni,

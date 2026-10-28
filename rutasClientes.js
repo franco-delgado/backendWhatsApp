@@ -28,16 +28,6 @@ router.post("/api/clientes", requireAuth, async (req, res) => {
   }
 });
 
-// Migración desde localStorage: { contactos: [...] }
-router.post("/api/clientes/importar", requireAuth, async (req, res) => {
-  try {
-    const data = await clientes.importar(req.user.id, req.body?.contactos);
-    res.json({ success: true, ...data });
-  } catch (e) {
-    responderError(res, e, "importar");
-  }
-});
-
 // Carga masiva desde Excel: { filas: [{ fila, nombre, apellido, dni, numero, monto }] }
 router.post("/api/clientes/importar-excel", requireAuth, async (req, res) => {
   try {
