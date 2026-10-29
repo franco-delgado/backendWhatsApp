@@ -133,15 +133,11 @@ const RE_PRESENTACION = /\b(soy|me llamo|mi nombre es|a nombre de|nombre|apellid
 
 // Saca el nombre de un mensaje SIN números. Devuelve las palabras normalizadas
 // (["juan", "perez"]) o null si el mensaje no parece traer un nombre.
-//  - "soy Juan Pérez, cuánto debo?"  -> ["juan","perez"]
-//  - "Juan Pérez" (respondiendo al pedido) -> ["juan","perez"]
-//  - "cuánto debo en octubre"        -> null (es una consulta, no un nombre)
 function extraerNombre(texto, { consulta = false } = {}) {
   const norm = clientes.normalizarTexto(texto);
   if (!norm) return null;
   const resto = norm.split(" ").filter((w) => !PALABRAS_NO_NOMBRE.has(w));
   if (resto.length < 1 || resto.length > 4 || resto.some((w) => w.length < 2)) return null;
-  // En medio de una consulta ("cuánto debo en octubre") solo es un nombre si se presentó.
   if (consulta && !RE_PRESENTACION.test(norm)) return null;
   return resto;
 }
@@ -155,6 +151,7 @@ function mensajeMonto(cliente, verificacion) {
     verificacion === "dni"
       ? "Verifiqué tu DNI ✅"
       : `Encontré a *${limpiarParaWhatsApp(`${cliente.nombre} ${cliente.apellido || ""}`)}* ✅`;
+
   if (cliente.monto <= 0) {
     return `${quien} Actualmente no registrás ningún monto pendiente de pago ✅`;
   }
@@ -190,11 +187,10 @@ async function responderConNombre(usuario, numero, palabras) {
   }
 
   if (encontrados.length === 0) {
-    if (palabras.length < 2) return MSG_FALTA_APELLIDO; // falta el apellido: no es un fallo
+    if (palabras.length < 2) return MSG_FALTA_APELLIDO;
     anotarFallo(clave);
     return bloqueado(clave) ? MSG_DERIVAR : MSG_NOMBRE_NO_ENCONTRADO;
   }
-  // Homónimos: no se adivina de quién es la deuda; se pide el DNI.
   if (encontrados.length > 1) return MSG_NOMBRE_AMBIGUO;
 
   fallos.delete(clave);
@@ -212,26 +208,27 @@ async function procesar({ usuario, numero, texto }) {
     const consulta = esConsultaDeuda(texto);
     const esperando = await esperandoDni(usuario.id, numero);
 
+    // MEJORA: Si el usuario envía directamente un número de DNI válido (6 a 8 dígitos), 
+    // lo procesamos de inmediato sin depender de si el bot estaba esperando o si hizo una pregunta previa.
+    if (digitos.length >= 6 && digitos.length <= 8) {
+      return await responderConDni(usuario, numero, digitos);
+    }
+
     if (!consulta && !esperando) return null;
 
-    // Ya mandó (o está mandando) el DNI.
+    // Si mandó dígitos pero con longitud distinta a un DNI estándar (ej. un número largo o raro)
     if (digitos.length > 0 && (esperando || consulta)) {
-      // Un mensaje con muchos números que no es un DNI (ej. un teléfono o un monto) en
-      // plena consulta: se pide de nuevo en vez de buscar basura.
       if (!clientes.dniValido(digitos)) return esperando ? MSG_DNI_INVALIDO : MSG_PEDIR_DNI;
       return await responderConDni(usuario, numero, digitos);
     }
 
-    // Sin números: puede haber dicho su nombre ("soy Juan Pérez", o solo "Juan Pérez"
-    // como respuesta al pedido).
+    // Sin números: puede haber dicho su nombre
     const palabras = extraerNombre(texto, { consulta });
     if (palabras) return await responderConNombre(usuario, numero, palabras);
 
     // Pregunta por su saldo y todavía no dio el DNI ni el nombre.
     if (consulta) return MSG_PEDIR_DNI;
 
-    // Estábamos esperando datos pero el mensaje no trae números ni un nombre: es otro tema,
-    // dejamos que siga el flujo normal.
     return null;
   } catch (e) {
     console.error("[BotDeuda] Error en la consulta de saldo:", e.message);

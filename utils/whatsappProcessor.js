@@ -5,9 +5,6 @@ const {
   enviarDocumentoWhatsApp,
 } = require("../whatsappService");
 
-// NOTA: este archivo tenía una segunda copia de procesarMensajeEntrante que
-// nadie llamaba (la buena vive en server.js) y que guardaba el sender sin
-// nombre. Se eliminó para que no haya dos rutas de guardado divergentes.
 
 async function procesarEnvio(payload = {}) {
   const number = payload.number || payload.to || payload.phone;
