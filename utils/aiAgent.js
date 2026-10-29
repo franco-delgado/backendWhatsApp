@@ -10,11 +10,8 @@ const ai = new GoogleGenAI({ apiKey: apiKey || "" });
 
 /**
  * Prompts de sistema personalizables según el rol de tu negocio.
- * Rol actual: asistente de relevamiento de requisitos para desarrollo de
- * páginas web y sistemas de software.
- *//**
- * Prompts de sistema personalizables según el rol de tu negocio.
- */const SYSTEM_INSTRUCTIONS = `
+ */
+const SYSTEM_INSTRUCTIONS = `
 Sos el chat automatizado de FARMANOR PAY. Tu función principal es explicar los
 requisitos para abrir una cuenta en Farmanor Pay, los beneficios de tenerla y guiar al cliente sobre cómo enviar su documentación, o derivar consultas sobre medicamentos a un representante.
 No sos un asistente general de la farmacia ni de ningún otro tema.
@@ -34,7 +31,7 @@ o emojis equivalentes), NO debés emitir ninguna respuesta (retorná un texto va
 
 MISION Y FLUJO DE ATENCIÓN:
 1. Si el cliente solo saluda (ej: "Hola", "Buenas"): Saludá cordialmente e invitá a conocer los requisitos para abrir la cuenta Farmanor Pay o sus beneficios.
-2. Si el cliente quiere abrir la cuenta o pregunta los requisitos: Explicá la lista de requisitos y decile que puede enviar las fotos directamente por este chat.
+2. If el cliente quiere abrir la cuenta o pregunta los requisitos: Explicá la lista de requisitos y decile que puede enviar las fotos directamente por este chat.
 
 REQUISITOS PARA ABRIR LA CUENTA (son los únicos que existen, no agregues, no
 inventes ni supongas otros; si el cliente pregunta por un requisito que no está
@@ -58,7 +55,9 @@ BENEFICIOS Y COSTOS DE LA CUENTA (son los únicos que existen, no agregues otros
 cambien las promociones del mes; el resto del prompt no cambia.)
 
 CONSULTAS DE PAGOS, SALDOS Y MEDICAMENTOS:
-- Si el cliente consulta por el monto a pagar, lo que debe, su saldo o el resumen de su cuenta, respondé ÚNICAMENTE con la marca [[PEDIR_DNI]] y nada más (el sistema se encarga de pedirle el DNI y de informarle el total). Vos nunca informes ni inventes montos.
+- Si el cliente consulta por el monto a pagar, lo que debe, su saldo o el resumen de su cuenta, respondé ÚNICAMENTE con a marca [[PEDIR_DNI]] y nada más (el sistema se encarga de pedirle el DNI o su nombre y apellido, y de informarle el total). Vos nunca informes ni inventes montos.
+- Si el sistema o el flujo externo te indica que **no se encontraron datos** (DNI o nombre no hallados en el sistema), y el cliente insiste, duda, pregunta si estás seguro o cuestiona la respuesta, respondé de manera amable con algo como: "No pude encontrar registros con esos datos. Voy a comunicarte con un representante para que pueda ayudarte personalmente."
+- Si el cliente pregunta si estás seguro de algo relacionado con sus datos, cuentas o validaciones y muestra desconfianza o duda, activá la derivación diciendo: "Voy a comunicarte con un representante para que pueda revisarlo con vos."
 - Si el cliente realiza preguntas sobre el pago de la cuenta (cómo, cuándo, dónde, con qué medio, hasta qué fecha, quién puede pagar, alias o fechas posteriores al 15), respondé usando ÚNICAMENTE la información del bloque "INFORMACIÓN DE PAGO DE LA CUENTA" de más abajo. Estas consultas NO usan la marca [[PEDIR_DNI]]; esa marca es solo para monto, deuda, saldo o resumen.
 - Si el cliente no quiere realizar trámites de Farmanor Pay y en su lugar consulta por la disponibilidad/stock
   de algún medicamento, su precio, costo o desea realizar un pedido, respondé amablemente indicando que en breve
@@ -93,7 +92,6 @@ Mantené un tono cordial y breve, con emojis ocasionales pero sin saturar.
 `;
 
 // Reintenta ante errores transitorios de Gemini (503 "sobrecargado", 429 "rate limit").
-// Otros errores (API key inválida, etc.) no tiene sentido reintentarlos: se cortan al toque.
 async function llamarConReintentos(payload, intentos = 3) {
   for (let intento = 1; intento <= intentos; intento++) {
     try {
@@ -103,7 +101,7 @@ async function llamarConReintentos(payload, intentos = 3) {
       const quedanIntentos = intento < intentos;
 
       if (esTransitorio && quedanIntentos) {
-        const esperaMs = 1000 * intento; // 1s, 2s, 3s...
+        const esperaMs = 1000 * intento;
         console.warn(
           `[IA Framework] Gemini sobrecargado (intento ${intento}/${intentos}). Reintentando en ${esperaMs}ms.`
         );
@@ -116,10 +114,6 @@ async function llamarConReintentos(payload, intentos = 3) {
   }
 }
 
-// Bloque que se suma al prompt cuando el número que escribe está en la agenda.
-// El nombre viene de la base (cargado por el usuario / Excel), no de lo que diga el
-// cliente; igual se limpia por si el Excel trae saltos de línea o texto largo.
-// NUNCA se le pasa el monto: la IA no informa ni conoce deudas (eso lo hace botDeuda).
 function bloqueClienteIdentificado(cliente) {
   if (!cliente) return "";
   const nombre = String(cliente.nombre || "")
@@ -141,10 +135,10 @@ Este bloque tiene prioridad sobre las reglas anteriores donde se contradigan:
 - Si solo saluda, saludalo por su nombre y preguntale en qué lo podés ayudar (consultas sobre el
   pago de su cuenta o pedidos de medicamentos).
 - Las consultas de monto, deuda o saldo siguen igual: respondé ÚNICAMENTE [[PEDIR_DNI]].
-- Seguí sin informar ni inventar montos.`;
+- Seguí sin informar ni inventar montos.`
+;
   }
 
-  // Está agendado pero todavía sin cuenta: solo se usa el nombre para saludar.
   return `
 
 CLIENTE IDENTIFICADO (dato verificado de la agenda del sistema): se llama *${nombre}*.
@@ -152,13 +146,6 @@ Podés llamarlo por ese nombre; la REGLA DE USO DEL NOMBRE no aplica a este nomb
 Todavía no tiene cuenta Farmanor Pay, así que el resto del flujo no cambia.`;
 }
 
-/**
- * Framework para interactuar con el modelo de IA.
- * @param {string} mensajeActual El texto del mensaje que acaba de enviar el cliente.
- * @param {Array} historialPrevio Lista opcional de mensajes anteriores para dar contexto.
- * @param {object|null} cliente Cliente de la agenda que escribe ({ nombre, alta }), si se lo reconoció.
- * @returns {Promise<string|null>} Texto de respuesta generado por la IA o null si falla.
- */
 async function responderConIA(mensajeActual, historialPrevio = [], cliente = null) {
   try {
     if (!apiKey) {
@@ -166,7 +153,6 @@ async function responderConIA(mensajeActual, historialPrevio = [], cliente = nul
       return null;
     }
 
-    // Formatear historial si se proporciona (útil para conversaciones continuas)
     const contents = [];
 
     if (Array.isArray(historialPrevio) && historialPrevio.length > 0) {
@@ -178,7 +164,6 @@ async function responderConIA(mensajeActual, historialPrevio = [], cliente = nul
       });
     }
 
-    // Agregar el mensaje actual del cliente
     contents.push({
       role: "user",
       parts: [{ text: mensajeActual }],
@@ -204,8 +189,6 @@ async function responderConIA(mensajeActual, historialPrevio = [], cliente = nul
   }
 }
 
-// Tamaño máximo de audio que se manda a Gemini (inline). Una nota de voz de WhatsApp
-// pesa unos pocos cientos de KB; esto solo frena archivos enormes.
 const MAX_AUDIO_BYTES = 15 * 1024 * 1024;
 
 const PROMPT_TRANSCRIPCION =
@@ -214,14 +197,6 @@ const PROMPT_TRANSCRIPCION =
   "Si dicta números (por ejemplo un DNI), escribilos con dígitos. " +
   "Si no hay voz o no se entiende nada, devolvé exactamente: [[SIN_VOZ]]";
 
-/**
- * Escucha un audio y lo transcribe a texto con Gemini.
- * El texto resultante sigue el mismo camino que un mensaje escrito (botDeuda + IA),
- * así las reglas del bot se aplican igual a lo que el cliente dice por voz.
- * @param {Buffer} buffer Contenido del audio.
- * @param {string} mimeType Ej: "audio/ogg; codecs=opus" (se limpian los parámetros).
- * @returns {Promise<string|null>} Transcripción, o null si no se pudo / no se entiende.
- */
 async function transcribirAudio(buffer, mimeType = "audio/ogg") {
   try {
     if (!apiKey) {
@@ -234,7 +209,6 @@ async function transcribirAudio(buffer, mimeType = "audio/ogg") {
       return null;
     }
 
-    // "audio/ogg; codecs=opus" -> "audio/ogg" (Gemini no acepta los parámetros)
     const mime = String(mimeType).split(";")[0].trim() || "audio/ogg";
 
     const response = await llamarConReintentos({

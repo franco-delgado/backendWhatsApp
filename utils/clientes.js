@@ -374,6 +374,42 @@ async function buscarPorDni(usuario, dni) {
   return global.data?.[0] ? aApi(global.data[0]) : null;
 }
 
+// ---------------------------------------------------------------------------
+// Búsqueda por NOMBRE (para la consulta de saldo del bot)
+// ---------------------------------------------------------------------------
+
+// Minúsculas, sin tildes ni signos: "María  Núñez!" -> "maria nunez".
+const normalizarTexto = (t) =>
+  String(t ?? "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+// ¿El cliente coincide con las palabras que escribió la persona (ya normalizadas)?
+//  - Cada palabra escrita debe ser una palabra COMPLETA del nombre o apellido del cliente
+//    (no vale "mar" para "María"), en cualquier orden: "perez juan" encuentra a "Juan Pérez".
+//  - Se exigen al menos 2 palabras (nombre y apellido). Única excepción: un cliente
+//    cargado con una sola palabra de nombre y sin apellido (p. ej. "Luis" desde el Excel).
+function coincideNombre(cliente, palabras) {
+  const propias = normalizarTexto(`${cliente.nombre} ${cliente.apellido || ""}`)
+    .split(" ")
+    .filter(Boolean);
+  if (palabras.length < 2 && propias.length > 1) return false;
+  return palabras.length > 0 && palabras.every((p) => propias.includes(p));
+}
+
+// Busca clientes por nombre y apellido. Devuelve TODOS los que coinciden (puede haber
+// homónimos; quien llama decide qué hacer si son varios). Un usuario busca en SU agenda;
+// el administrador, si no encuentra en la suya, busca en la de todos (igual que el DNI).
+async function buscarPorNombre(usuario, palabras) {
+  const propios = (await listar(usuario.id)).filter((c) => coincideNombre(c, palabras));
+  if (propios.length || usuario.role !== "admin") return propios;
+  return (await listar("todos")).filter((c) => coincideNombre(c, palabras));
+}
+
 // Busca al cliente que escribe por su número de WhatsApp (compara los últimos 10 dígitos:
 // 549XXXXXXXXXX y 54XXXXXXXXXX son el mismo celular). Sirve para que el bot sepa con
 // quién habla. Un usuario busca en SU agenda; el administrador, si no lo encuentra en la
@@ -416,5 +452,8 @@ module.exports = {
   importarFilas,
   marcarInvitado,
   buscarPorDni,
+  buscarPorNombre,
+  coincideNombre,
+  normalizarTexto,
   buscarPorTelefono,
 };

@@ -2,9 +2,13 @@
 //
 // Flujo:
 //   1. El cliente pregunta cuánto debe / cuánto tiene que pagar.
-//   2. El bot le pide su DNI sin puntos ni comas.
-//   3. El cliente lo envía (con o sin puntos, espacios, texto alrededor...): se
-//      dejan solo los dígitos y se compara con los DNI de la agenda.
+//   2. El bot le pide su DNI (sin puntos ni comas) o su nombre y apellido.
+//   3. El cliente responde:
+//      - DNI (con o sin puntos, espacios, texto alrededor...): se dejan solo los dígitos
+//        y se compara con los DNI de la agenda.
+//      - Nombre y apellido: se compara (sin tildes ni mayúsculas) con la agenda. Solo se
+//        responde si coincide UN solo cliente; si hay homónimos se pide el DNI, para no
+//        informar la deuda de otra persona.
 //   4. Si lo encuentra, le informa el total a pagar.
 //
 // El monto lo arma el servidor leyendo la base. La IA nunca lo ve ni lo inventa.
@@ -18,8 +22,8 @@ const clientes = require("./clientes");
 const FRASE_ESPERA = "sin puntos ni comas";
 
 const MSG_PEDIR_DNI =
-  "Para consultar el total a pagar necesito tu número de DNI 🙂\n" +
-  "Enviámelo sin puntos ni comas (por ejemplo: 27345678).";
+  "Para consultar el total a pagar necesito tu número de DNI o tu nombre y apellido 🙂\n" +
+  "Si es el DNI, enviámelo sin puntos ni comas (por ejemplo: 27345678).";
 
 const MSG_DNI_INVALIDO =
   "No pude leer un DNI válido. Tiene que tener entre 6 y 8 números, " +
@@ -28,6 +32,17 @@ const MSG_DNI_INVALIDO =
 const MSG_NO_ENCONTRADO =
   "No encontré ese DNI en nuestros registros 😕\n" +
   "Revisalo y enviámelo de nuevo, sin puntos ni comas.";
+
+const MSG_NOMBRE_NO_ENCONTRADO =
+  "No encontré ese nombre en nuestros registros 😕\n" +
+  "Revisalo, o enviame tu DNI sin puntos ni comas.";
+
+const MSG_NOMBRE_AMBIGUO =
+  "Encontré más de un cliente con ese nombre 🙂 Para estar seguros de que es tu cuenta, " +
+  "enviame tu DNI sin puntos ni comas (por ejemplo: 27345678).";
+
+const MSG_FALTA_APELLIDO =
+  "Necesito tu nombre y apellido completos, o tu DNI sin puntos ni comas, para buscar tu cuenta 🙂";
 
 const MSG_DERIVAR =
   "No pude verificar tu DNI. En cuanto sea posible un representante se estará comunicando con vos.";
@@ -45,7 +60,7 @@ const ult10 = (n) => String(n || "").replace(/\D/g, "").slice(-10);
 // ¿El mensaje pregunta por lo que debe / el monto a pagar?
 // Se excluye "cuenta" suelta: "quiero abrir la cuenta" no es una consulta de saldo.
 const RE_CONSULTA =
-  /\b(cu[aá]nto\s+(debo|tengo|es|son|sale|me\s+toca|hay|pago|abono|adeudo)|cu[aá]nto\s+.{0,25}(pagar|abonar|deuda)|monto|saldo|deuda|adeudo|debo|abonar|total\s+a\s+pagar|importe|resumen\s+de\s+(mi\s+)?cuenta)\b/i;
+  /\b(cu[aá]nto\s+(debo|debe|tengo|es|son|sale|me\s+toca|hay|pago|abono|adeudo)|cu[aá]nto\s+.{0,25}(pagar|abonar|deuda)|monto|saldo|deuda|adeudo|debo|abonar|total\s+a\s+pagar|importe|resumen\s+de\s+(mi\s+)?cuenta)\b/i;
 
 function esConsultaDeuda(texto) {
   const t = String(texto || "");
@@ -95,6 +110,60 @@ function anotarFallo(clave) {
   else f.n++;
 }
 
+// Opcional (BOT_NOMBRE_EXIGE_MISMO_TELEFONO=1): por NOMBRE solo se informa el monto si quien
+// escribe lo hace desde el teléfono agendado de ese cliente. Evita que alguien consulte la
+// deuda de otra persona sabiendo solo su nombre. Por DNI no se aplica.
+const EXIGIR_MISMO_TELEFONO = process.env.BOT_NOMBRE_EXIGE_MISMO_TELEFONO === "1";
+
+// Palabras que NO son parte de un nombre: saludos, la propia consulta y relleno. Lo que queda
+// después de sacarlas es el nombre. (Ya normalizadas: sin tildes, en minúsculas.)
+const PALABRAS_NO_NOMBRE = new Set(
+  (
+    "hola buenas buenos dia dias tarde tardes noche noches soy me llamo llama mi mio mia nombre apellido " +
+    "titular es son a de del el la lo los las un una por favor porfa porfavor quiero quisiera queria " +
+    "necesito saber consultar consulta cuanto cuanta debo debe deuda adeudo saldo monto pago pagar " +
+    "abonar abono total importe resumen cuenta tengo tenes que cual sale toca hay y mas gracias dni " +
+    "documento numero para con si no se nose nada ok dale bueno listo perfecto ya ayuda disculpa " +
+    "disculpe perdon ahora aca aqui medicamento medicamentos pedido precio stock receta"
+  ).split(" ")
+);
+
+// Frases con las que alguien dice su nombre ("soy...", "a nombre de...", "cuánto debe ...").
+const RE_PRESENTACION = /\b(soy|me llamo|mi nombre es|a nombre de|nombre|apellido|titular|cuanto debe)\b/;
+
+// Saca el nombre de un mensaje SIN números. Devuelve las palabras normalizadas
+// (["juan", "perez"]) o null si el mensaje no parece traer un nombre.
+//  - "soy Juan Pérez, cuánto debo?"  -> ["juan","perez"]
+//  - "Juan Pérez" (respondiendo al pedido) -> ["juan","perez"]
+//  - "cuánto debo en octubre"        -> null (es una consulta, no un nombre)
+function extraerNombre(texto, { consulta = false } = {}) {
+  const norm = clientes.normalizarTexto(texto);
+  if (!norm) return null;
+  const resto = norm.split(" ").filter((w) => !PALABRAS_NO_NOMBRE.has(w));
+  if (resto.length < 1 || resto.length > 4 || resto.some((w) => w.length < 2)) return null;
+  // En medio de una consulta ("cuánto debo en octubre") solo es un nombre si se presentó.
+  if (consulta && !RE_PRESENTACION.test(norm)) return null;
+  return resto;
+}
+
+// Escapa lo que WhatsApp interpretaría como formato (*negrita*, _cursiva_, ~tachado~).
+const limpiarParaWhatsApp = (t) => String(t || "").replace(/[*_~`]/g, "").trim();
+
+// Arma la respuesta con el total. `verificacion` = cómo se identificó al cliente.
+function mensajeMonto(cliente, verificacion) {
+  const quien =
+    verificacion === "dni"
+      ? "Verifiqué tu DNI ✅"
+      : `Encontré a *${limpiarParaWhatsApp(`${cliente.nombre} ${cliente.apellido || ""}`)}* ✅`;
+  if (cliente.monto <= 0) {
+    return `${quien} Actualmente no registrás ningún monto pendiente de pago ✅`;
+  }
+  return (
+    `${quien} El total a pagar es de *${formatearMonto(cliente.monto)}*.\n` +
+    "Recordá abonar antes del día 15 para evitar el recargo de intereses."
+  );
+}
+
 // Busca el DNI y arma la respuesta con el total.
 async function responderConDni(usuario, numero, dni) {
   const clave = `${usuario.id}:${ult10(numero)}`;
@@ -107,13 +176,29 @@ async function responderConDni(usuario, numero, dni) {
   }
 
   fallos.delete(clave);
-  if (cliente.monto <= 0) {
-    return "Verifiqué tu DNI y actualmente no registrás ningún monto pendiente de pago ✅";
+  return mensajeMonto(cliente, "dni");
+}
+
+// Busca por nombre y apellido y arma la respuesta con el total.
+async function responderConNombre(usuario, numero, palabras) {
+  const clave = `${usuario.id}:${ult10(numero)}`;
+  if (bloqueado(clave)) return MSG_DERIVAR;
+
+  let encontrados = await clientes.buscarPorNombre(usuario, palabras);
+  if (EXIGIR_MISMO_TELEFONO) {
+    encontrados = encontrados.filter((c) => ult10(c.numero) === ult10(numero));
   }
-  return (
-    `Verifiqué tu DNI ✅ El total a pagar es de *${formatearMonto(cliente.monto)}*.\n` +
-    "Recordá abonar antes del día 15 para evitar el recargo de intereses."
-  );
+
+  if (encontrados.length === 0) {
+    if (palabras.length < 2) return MSG_FALTA_APELLIDO; // falta el apellido: no es un fallo
+    anotarFallo(clave);
+    return bloqueado(clave) ? MSG_DERIVAR : MSG_NOMBRE_NO_ENCONTRADO;
+  }
+  // Homónimos: no se adivina de quién es la deuda; se pide el DNI.
+  if (encontrados.length > 1) return MSG_NOMBRE_AMBIGUO;
+
+  fallos.delete(clave);
+  return mensajeMonto(encontrados[0], "nombre");
 }
 
 /**
@@ -137,10 +222,15 @@ async function procesar({ usuario, numero, texto }) {
       return await responderConDni(usuario, numero, digitos);
     }
 
-    // Pregunta por su saldo y todavía no dio el DNI.
+    // Sin números: puede haber dicho su nombre ("soy Juan Pérez", o solo "Juan Pérez"
+    // como respuesta al pedido).
+    const palabras = extraerNombre(texto, { consulta });
+    if (palabras) return await responderConNombre(usuario, numero, palabras);
+
+    // Pregunta por su saldo y todavía no dio el DNI ni el nombre.
     if (consulta) return MSG_PEDIR_DNI;
 
-    // Estábamos esperando el DNI pero el mensaje no trae números: es otro tema,
+    // Estábamos esperando datos pero el mensaje no trae números ni un nombre: es otro tema,
     // dejamos que siga el flujo normal.
     return null;
   } catch (e) {
@@ -153,6 +243,7 @@ module.exports = {
   procesar,
   esConsultaDeuda,
   extraerDigitos,
+  extraerNombre,
   formatearMonto,
   MSG_PEDIR_DNI,
   MSG_SIN_DATOS,
