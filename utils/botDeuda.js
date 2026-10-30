@@ -55,75 +55,58 @@ function esConsultaDeuda(texto) {
   return RE_CONSULTA.test(t);
 }
 
-// Saca el DNI de un mensaje libre y devuelve SOLO dígitos.
-//   "27345678" / "27.345.678" / "27,345,678" / "27 345 678" / "DNI: 27345678"   -> "27345678"
-//   "tengo 2 hijos, mi dni es 27345678"                                          -> "27345678"
-//   "mi tel es 3825123456 y mi dni 27.345.678"                                   -> "27345678"
-// Antes se juntaban TODOS los números del mensaje, así que cualquier otro número
-// ("2 hijos", un teléfono...) rompía la lectura del DNI.
-// Si no hay ningún número con forma de DNI, devuelve todos los dígitos juntos
-// (el llamador los rechaza por inválidos) o "" si no hay ninguno.
-function extraerDni(texto) {
-  const t = String(texto ?? "");
-  const grupos = t.match(/\d+(?:[.,\s]\d+)*/g) || []; // "27.345.678", "27 345 678", "2", "3825123456"
-  for (const g of grupos) {
-    const junto = clientes.limpiarDni(g);
-    if (clientes.dniValido(junto)) return junto;
+// Solo dígitos de TODO el texto: sirve para saber si el mensaje trae algún número.
+const extraerDigitos = clientes.limpiarDni;
+
+// Busca el/los posibles DNI dentro del mensaje. Antes se juntaban TODOS los dígitos del
+// texto, así que "mi dni es 27345678, tengo 35 años" o "27345678 y mi cel es 3825123456"
+// daba un número de 10+ dígitos, se rechazaba como DNI inválido y el bot nunca lo buscaba.
+//
+// Reconoce "27345678", "27.345.678", "27,345,678", "27 345 678", "DNI: 27345678".
+// Devuelve hasta MAX_CANDIDATOS números de 6 a 8 dígitos, primero los que van pegados a
+// la palabra "DNI"/"documento" y después el resto, de izquierda a derecha.
+const MAX_CANDIDATOS = 3; // tope: frena a quien manda muchos números para probar DNI al azar
+const RE_TRAMO_NUMERICO = /\d(?:[\d.,\-\s]*\d)?/g;
+const RE_ROTULO_DNI = /(?:d\.?\s?n\.?\s?i\.?|documento)\W{0,4}$/i;
+
+function extraerCandidatosDni(texto) {
+  const t = String(texto || "");
+  const rotulados = [];
+  const otros = [];
+  const vistos = new Set();
+
+  const agregar = (digitos, rotulado) => {
+    if (!clientes.dniValido(digitos) || vistos.has(digitos)) return;
+    vistos.add(digitos);
+    (rotulado ? rotulados : otros).push(digitos);
+  };
+
+  for (const m of t.matchAll(RE_TRAMO_NUMERICO)) {
+    const tramo = m[0];
+    const rotulado = RE_ROTULO_DNI.test(t.slice(Math.max(0, m.index - 12), m.index));
+
+    // 1) El tramo completo: "27.345.678" o "27 345 678" (puntos/espacios dentro del DNI).
+    const completo = clientes.limpiarDni(tramo);
+    if (clientes.dniValido(completo)) {
+      agregar(completo, rotulado);
+      continue;
+    }
+    // 2) Si el tramo mezcla varios números ("27345678 3825123456"), cada uno por separado.
+    for (const parte of tramo.split(/\s+/)) agregar(clientes.limpiarDni(parte), rotulado);
   }
-  // Un grupo pegado a otro número ("27345678 3825123456"): se prueba número por número.
-  for (const n of t.match(/\d+/g) || []) {
-    if (clientes.dniValido(n)) return n;
-  }
-  return clientes.limpiarDni(t);
+
+  return [...rotulados, ...otros].slice(0, MAX_CANDIDATOS);
 }
-const extraerDigitos = extraerDni;
 
 const formatearMonto = (monto) =>
   "$" + Number(monto).toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-// Nombre y apellido tal como están en la agenda, listos para WhatsApp: sin saltos de línea
-// ni asteriscos (que romperían el *negrita*) y con un largo razonable.
-function nombreCompleto(cliente) {
-  return `${cliente.nombre || ""} ${cliente.apellido || ""}`
-    .replace(/[\r\n\t*_~`]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 80);
-}
-
-// Marca en memoria de "le pedí el DNI a este número". Es un respaldo del historial de la
-// base: cubre el caso en que el cliente contesta antes de que el pedido quede guardado,
-// o en que la lectura del historial falla. Se pierde al reiniciar; la base cubre ese caso.
-const esperas = new Map(); // últimos 10 dígitos -> timestamp
-const marcarEspera = (numero) => esperas.set(ult10(numero), Date.now());
-const limpiarEspera = (numero) => esperas.delete(ult10(numero));
-function esperaEnMemoria(numero) {
-  const t = esperas.get(ult10(numero));
-  if (!t) return false;
-  if (Date.now() - t > VENTANA_ESPERA_MS) {
-    esperas.delete(ult10(numero));
-    return false;
-  }
-  return true;
-}
-
-// Supabase puede devolver la fecha sin zona horaria ("2026-10-30T06:00:00"): JavaScript la
-// tomaría como hora local del servidor y el pedido de DNI parecería vencido (o del futuro).
-// Las fechas de la base están en UTC, así que se fuerza.
-function aMs(fecha) {
-  const s = String(fecha || "");
-  return new Date(/[zZ]|[+-]\d\d(:?\d\d)?$/.test(s) ? s : s.replace(" ", "T") + "Z").getTime();
-}
-
-// ¿Le pedimos el DNI a este cliente y todavía está vigente el pedido?
-// Se mira el último mensaje del bot en esa conversación (se identifica por el número, no por
-// el usuario: así no depende de a qué usuario quedó asignado el contacto).
-async function esperandoDni(numero) {
-  if (esperaEnMemoria(numero)) return true;
-
+// ¿El último mensaje del bot en esta conversación quedó esperando el DNI?
+async function esperandoDni(userId, numero) {
   const { data, error } = await supabase
     .from("messages")
     .select("body, created_at")
+    .eq("user_id", userId)
     .ilike("sender", `Soporte (%${ult10(numero)})`)
     .order("created_at", { ascending: false })
     .limit(1);
@@ -133,7 +116,7 @@ async function esperandoDni(numero) {
   }
   const ultimo = data?.[0];
   if (!ultimo) return false;
-  const reciente = Date.now() - aMs(ultimo.created_at) < VENTANA_ESPERA_MS;
+  const reciente = Date.now() - new Date(ultimo.created_at).getTime() < VENTANA_ESPERA_MS;
   return reciente && String(ultimo.body || "").includes(FRASE_ESPERA);
 }
 
@@ -152,34 +135,29 @@ function anotarFallo(clave) {
   else f.n++;
 }
 
-// Busca el DNI y arma la respuesta con el total.
-async function responderConDni(usuario, numero, dni) {
+// Busca el DNI y arma la respuesta con el total. `candidatos` es la lista de posibles
+// DNI del mensaje; se usa el primero que esté en la agenda. Un mensaje cuenta como UN
+// solo intento fallido aunque traiga varios números.
+async function responderConDni(usuario, numero, candidatos) {
   const clave = `${usuario.id}:${ult10(numero)}`;
   if (bloqueado(clave)) return MSG_DERIVAR;
 
-  const cliente = await clientes.buscarPorDni(usuario, dni, numero);
+  let cliente = null;
+  for (const dni of candidatos) {
+    cliente = await clientes.buscarPorDni(usuario, dni);
+    if (cliente) break;
+  }
   if (!cliente) {
     anotarFallo(clave);
-    // Diagnóstico (sin el DNI completo): ayuda a distinguir "no existe" de "está en la agenda de otro usuario".
-    const enOtra = await clientes.existeEnOtraAgenda(usuario, dni);
-    console.warn(
-      `[BotDeuda] DNI ***${dni.slice(-3)} no encontrado para el usuario ${usuario.id}` +
-        (enOtra ? " (existe en la agenda de OTRO usuario)" : " (no existe en ninguna agenda)")
-    );
     return bloqueado(clave) ? MSG_DERIVAR : MSG_NO_ENCONTRADO;
   }
 
   fallos.delete(clave);
-  limpiarEspera(numero); // ya se resolvió: un número posterior no se toma como DNI
-  const nombre = nombreCompleto(cliente);
-  const saludo = nombre ? `Verifiqué tu DNI ✅ *${nombre}*` : "Verifiqué tu DNI ✅";
-
   if (cliente.monto <= 0) {
-    return `${saludo}\nActualmente no registrás ningún monto pendiente de pago.`;
+    return "Verifiqué tu DNI y actualmente no registrás ningún monto pendiente de pago ✅";
   }
   return (
-    `${saludo}\n` +
-    `El total a pagar es de *${formatearMonto(cliente.monto)}*.\n` +
+    `Verifiqué tu DNI ✅ El total a pagar es de *${formatearMonto(cliente.monto)}*.\n` +
     "Recordá abonar antes del día 15 para evitar el recargo de intereses."
   );
 }
@@ -191,33 +169,24 @@ async function responderConDni(usuario, numero, dni) {
  */
 async function procesar({ usuario, numero, texto }) {
   try {
-    const digitos = extraerDni(texto);
+    const digitos = extraerDigitos(texto);
     const consulta = esConsultaDeuda(texto);
-    const esperando = await esperandoDni(numero);
-
-    console.log(
-      `[BotDeuda] ${ult10(numero)} | consulta=${consulta} esperandoDni=${esperando} ` +
-        `digitosLeidos=${digitos.length}`
-    );
+    const esperando = await esperandoDni(usuario.id, numero);
 
     if (!consulta && !esperando) return null;
 
     // Ya mandó (o está mandando) el DNI.
     if (digitos.length > 0 && (esperando || consulta)) {
-      // Un mensaje con muchos números que no es un DNI (ej. un teléfono o un monto) en
-      // plena consulta: se pide de nuevo en vez de buscar basura.
-      if (!clientes.dniValido(digitos)) {
-        marcarEspera(numero);
-        return esperando ? MSG_DNI_INVALIDO : MSG_PEDIR_DNI;
-      }
-      return await responderConDni(usuario, numero, digitos);
+      // Se busca el DNI DENTRO del mensaje (puede venir con texto u otros números).
+      // Si no hay ningún número que pueda ser un DNI (ej. solo un monto o una edad),
+      // se pide de nuevo en vez de buscar basura.
+      const candidatos = extraerCandidatosDni(texto);
+      if (candidatos.length === 0) return esperando ? MSG_DNI_INVALIDO : MSG_PEDIR_DNI;
+      return await responderConDni(usuario, numero, candidatos);
     }
 
     // Pregunta por su saldo y todavía no dio el DNI.
-    if (consulta) {
-      marcarEspera(numero);
-      return MSG_PEDIR_DNI;
-    }
+    if (consulta) return MSG_PEDIR_DNI;
 
     // Estábamos esperando el DNI pero el mensaje no trae números: es otro tema,
     // dejamos que siga el flujo normal.
@@ -232,8 +201,7 @@ module.exports = {
   procesar,
   esConsultaDeuda,
   extraerDigitos,
-  extraerDni,
-  marcarEspera,
+  extraerCandidatosDni,
   formatearMonto,
   MSG_PEDIR_DNI,
   MSG_SIN_DATOS,

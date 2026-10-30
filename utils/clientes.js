@@ -152,7 +152,7 @@ async function telefonosGlobales() {
   for (let desde = 0; ; desde += TAMANO_PAGINA) {
     const { data, error } = await supabase
       .from("clientes")
-      .select("id, numero, user_id, monto, alta")
+      .select("id, numero, user_id, monto, alta, dni")
       .order("id", { ascending: true })
       .range(desde, desde + TAMANO_PAGINA - 1);
     if (error) throw traducir(error);
@@ -226,7 +226,8 @@ async function eliminar(userId, id) {
 // Cobrar (si tienen monto) y NO en Invitar. Por cada fila:
 //   - Teléfono NUEVO                      -> se crea el cliente, con alta.
 //   - Teléfono ya en la agenda del usuario -> se ACTUALIZA el monto a cobrar y, si todavía
-//                                            no tenía alta, se le da (el resto no se toca).
+//                                            no tenía alta, se le da. Si no tenía DNI y el
+//                                            Excel lo trae, se completa (el resto no se toca).
 //   - Teléfono agendado por OTRO usuario   -> no se carga ni se toca; se informa de quién es.
 //   - DNI ya cargado (con otro teléfono) o teléfono repetido dentro del mismo archivo
 //                                          -> no se carga; queda en `errores` con su fila.
@@ -269,14 +270,23 @@ async function importarFilas(userId, filas) {
         }
         // Ya está en la agenda de este usuario: se actualiza el monto y se le da el alta
         // si no la tenía (si ya la tenía, no se toca su fecha de alta).
+        // Si el cliente todavía no tenía DNI y el Excel lo trae, se lo completa: sin DNI
+        // el bot no puede encontrarlo. Nunca se pisa un DNI ya cargado, ni se repite uno
+        // que ya es de otro cliente de esta agenda.
+        let dniNuevo = null;
+        if (datos.dni && !existente.dni && !dnis.has(datos.dni)) {
+          dniNuevo = datos.dni;
+          dnis.add(dniNuevo);
+        }
         const mismoMonto = Number(existente.monto) === datos.monto;
-        if (mismoMonto && existente.alta) sinCambios++;
+        if (mismoMonto && existente.alta && !dniNuevo) sinCambios++;
         else {
           aActualizar.push({
             fila: nroFila,
             id: existente.id,
             monto: datos.monto,
             darAlta: !existente.alta,
+            dni: dniNuevo,
           });
         }
         continue;
@@ -322,6 +332,7 @@ async function importarFilas(userId, filas) {
             monto: u.monto,
             updated_at: ahora,
             ...(u.darAlta ? { alta: true, fecha_alta: ahora } : {}),
+            ...(u.dni ? { dni: u.dni } : {}),
           })
           .eq("id", u.id)
           .eq("user_id", userId); // solo se toca lo propio
@@ -351,63 +362,27 @@ async function marcarInvitado(userId, numero) {
   return data?.length || 0;
 }
 
-// "27345678" -> "%2%7%3%4%5%6%7%8%": coincide con "27.345.678", " 27345678", "27 345 678"...
-// Sirve para encontrar DNI que quedaron guardados con puntos o espacios (cargas manuales
-// o anteriores a la limpieza). Después se confirma en JS que los dígitos sean EXACTAMENTE los mismos.
-const patronTolerante = (d) => "%" + d.split("").join("%") + "%";
-
-// Filas de `clientes` cuyo DNI (solo dígitos) es `d`. `userId` = null busca en todas las agendas.
-//   1) Coincidencia exacta (rápida, usa el índice).
-//   2) Si no hay, coincidencia tolerante a puntos/espacios guardados en la base.
-async function filasPorDni(d, userId = null) {
-  let q = supabase.from("clientes").select("*").eq("dni", d).limit(10);
-  if (userId) q = q.eq("user_id", userId);
-  const exacta = await q;
-  if (exacta.error) throw traducir(exacta.error);
-  if (exacta.data?.length) return exacta.data;
-
-  let t = supabase.from("clientes").select("*").ilike("dni", patronTolerante(d)).limit(50);
-  if (userId) t = t.eq("user_id", userId);
-  const tolerante = await t;
-  // Si la columna no es de texto, el ilike falla: no es un error del cliente, simplemente no hay más que probar.
-  if (tolerante.error) {
-    console.warn("[Clientes] Búsqueda tolerante de DNI no disponible:", tolerante.error.message);
-    return [];
-  }
-  return (tolerante.data || []).filter((r) => limpiarDni(r.dni) === d);
-}
-
 // Busca un cliente por DNI (comparando solo dígitos). Devuelve null si no existe.
 // Un usuario busca en SU agenda; el administrador, si no lo encuentra en la suya,
 // busca en la de todos (los clientes que escriben por su cuenta le llegan a él).
-// `numero` (opcional) = teléfono de WhatsApp de quien escribe: si el mismo DNI está en varias
-// agendas, se prefiere al cliente cuyo teléfono coincide.
-async function buscarPorDni(usuario, dni, numero = null) {
+async function buscarPorDni(usuario, dni) {
   const d = limpiarDni(dni);
   if (!dniValido(d)) return null;
 
-  const propias = await filasPorDni(d, usuario.id);
-  if (propias[0]) return aApi(propias[0]);
+  const propio = await supabase
+    .from("clientes")
+    .select("*")
+    .eq("user_id", usuario.id)
+    .eq("dni", d)
+    .maybeSingle();
+  if (propio.error) throw traducir(propio.error);
+  if (propio.data) return aApi(propio.data);
 
   if (usuario.role !== "admin") return null;
 
-  const todas = await filasPorDni(d, null);
-  if (!todas.length) return null;
-  const k = limpiarNumero(numero).slice(-10);
-  const elegida = (k && todas.find((r) => String(r.numero).endsWith(k))) || todas[0];
-  return aApi(elegida);
-}
-
-// Solo para diagnóstico en el log del servidor: ¿ese DNI existe en la agenda de OTRO usuario?
-// (No se usa para responderle al cliente: cada usuario solo ve su propia agenda.)
-async function existeEnOtraAgenda(usuario, dni) {
-  try {
-    const d = limpiarDni(dni);
-    const filas = await filasPorDni(d, null);
-    return filas.some((r) => r.user_id !== usuario.id);
-  } catch (e) {
-    return false;
-  }
+  const global = await supabase.from("clientes").select("*").eq("dni", d).limit(1);
+  if (global.error) throw traducir(global.error);
+  return global.data?.[0] ? aApi(global.data[0]) : null;
 }
 
 // Busca al cliente que escribe por su número de WhatsApp (compara los últimos 10 dígitos:
@@ -452,6 +427,5 @@ module.exports = {
   importarFilas,
   marcarInvitado,
   buscarPorDni,
-  existeEnOtraAgenda,
   buscarPorTelefono,
 };
