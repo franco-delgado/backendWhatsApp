@@ -55,47 +55,34 @@ function esConsultaDeuda(texto) {
   return RE_CONSULTA.test(t);
 }
 
-// Solo dígitos de TODO el texto: sirve para saber si el mensaje trae algún número.
+// "27.345.678" / "27,345,678" / "27 345 678" / "DNI: 27345678" -> "27345678"
 const extraerDigitos = clientes.limpiarDni;
 
-// Busca el/los posibles DNI dentro del mensaje. Antes se juntaban TODOS los dígitos del
-// texto, así que "mi dni es 27345678, tengo 35 años" o "27345678 y mi cel es 3825123456"
-// daba un número de 10+ dígitos, se rechazaba como DNI inválido y el bot nunca lo buscaba.
-//
-// Reconoce "27345678", "27.345.678", "27,345,678", "27 345 678", "DNI: 27345678".
-// Devuelve hasta MAX_CANDIDATOS números de 6 a 8 dígitos, primero los que van pegados a
-// la palabra "DNI"/"documento" y después el resto, de izquierda a derecha.
-const MAX_CANDIDATOS = 3; // tope: frena a quien manda muchos números para probar DNI al azar
-const RE_TRAMO_NUMERICO = /\d(?:[\d.,\-\s]*\d)?/g;
-const RE_ROTULO_DNI = /(?:d\.?\s?n\.?\s?i\.?|documento)\W{0,4}$/i;
+// Saca el DNI de un mensaje. Antes se juntaban TODOS los dígitos del mensaje, así que
+// "mi dni es 27345678 y mi cel 3825123456" daba 18 dígitos y se rechazaba.
+//  1) Si todos los dígitos juntos forman un DNI válido ("27.345.678", "DNI: 27345678"), ese es.
+//  2) Si hay más números, se toma el que viene después de la palabra "DNI".
+//  3) Si no, el único número con forma de DNI (6 a 8 dígitos, no parte de uno más largo).
+// Devuelve null si no hay un DNI claro (0 o más de uno).
+const GRUPO_DNI = "\\d{1,2}[.,\\s]\\d{3}[.,\\s]\\d{3}|\\d{6,8}";
+const RE_DNI_PALABRA = new RegExp(`\\bd\\.?\\s?n\\.?\\s?i\\.?\\D{0,15}?(${GRUPO_DNI})(?!\\d)`, "i");
+const RE_DNI_SUELTO = new RegExp(`(?<!\\d)(${GRUPO_DNI})(?!\\d)`, "g");
 
-function extraerCandidatosDni(texto) {
+function extraerDni(texto) {
   const t = String(texto || "");
-  const rotulados = [];
-  const otros = [];
-  const vistos = new Set();
+  const todo = clientes.limpiarDni(t);
+  if (clientes.dniValido(todo)) return todo;
 
-  const agregar = (digitos, rotulado) => {
-    if (!clientes.dniValido(digitos) || vistos.has(digitos)) return;
-    vistos.add(digitos);
-    (rotulado ? rotulados : otros).push(digitos);
-  };
-
-  for (const m of t.matchAll(RE_TRAMO_NUMERICO)) {
-    const tramo = m[0];
-    const rotulado = RE_ROTULO_DNI.test(t.slice(Math.max(0, m.index - 12), m.index));
-
-    // 1) El tramo completo: "27.345.678" o "27 345 678" (puntos/espacios dentro del DNI).
-    const completo = clientes.limpiarDni(tramo);
-    if (clientes.dniValido(completo)) {
-      agregar(completo, rotulado);
-      continue;
-    }
-    // 2) Si el tramo mezcla varios números ("27345678 3825123456"), cada uno por separado.
-    for (const parte of tramo.split(/\s+/)) agregar(clientes.limpiarDni(parte), rotulado);
+  const conPalabra = t.match(RE_DNI_PALABRA);
+  if (conPalabra) {
+    const d = clientes.limpiarDni(conPalabra[1]);
+    if (clientes.dniValido(d)) return d;
   }
 
-  return [...rotulados, ...otros].slice(0, MAX_CANDIDATOS);
+  const candidatos = [...new Set([...t.matchAll(RE_DNI_SUELTO)].map((m) => clientes.limpiarDni(m[1])))].filter(
+    clientes.dniValido
+  );
+  return candidatos.length === 1 ? candidatos[0] : null;
 }
 
 const formatearMonto = (monto) =>
@@ -105,16 +92,16 @@ const formatearMonto = (monto) =>
 async function esperandoDni(userId, numero) {
   const { data, error } = await supabase
     .from("messages")
-    .select("body, created_at")
+    .select("sender, body, created_at")
     .eq("user_id", userId)
-    .ilike("sender", `Soporte (%${ult10(numero)})`)
+    .ilike("sender", `%${ult10(numero)})`) // mismo filtro que el historial de la IA (entrantes y salientes)
     .order("created_at", { ascending: false })
-    .limit(1);
+    .limit(15);
   if (error) {
     console.error("[BotDeuda] No se pudo leer el último mensaje del bot:", error.message);
     return false;
   }
-  const ultimo = data?.[0];
+  const ultimo = (data || []).find((m) => String(m.sender || "").startsWith("Soporte ("));
   if (!ultimo) return false;
   const reciente = Date.now() - new Date(ultimo.created_at).getTime() < VENTANA_ESPERA_MS;
   return reciente && String(ultimo.body || "").includes(FRASE_ESPERA);
@@ -135,18 +122,16 @@ function anotarFallo(clave) {
   else f.n++;
 }
 
-// Busca el DNI y arma la respuesta con el total. `candidatos` es la lista de posibles
-// DNI del mensaje; se usa el primero que esté en la agenda. Un mensaje cuenta como UN
-// solo intento fallido aunque traiga varios números.
-async function responderConDni(usuario, numero, candidatos) {
+// Busca el DNI y arma la respuesta con el total.
+async function responderConDni(usuario, numero, dni) {
   const clave = `${usuario.id}:${ult10(numero)}`;
   if (bloqueado(clave)) return MSG_DERIVAR;
 
-  let cliente = null;
-  for (const dni of candidatos) {
-    cliente = await clientes.buscarPorDni(usuario, dni);
-    if (cliente) break;
-  }
+  const cliente = await clientes.buscarPorDni(usuario, dni, numero);
+  console.log(
+    `[BotDeuda] DNI ***${dni.slice(-3)} (${dni.length} díg.) de ${ult10(numero)} -> ` +
+      `${cliente ? "ENCONTRADO" : "NO encontrado"} (usuario ${usuario.id}, rol ${usuario.role})`
+  );
   if (!cliente) {
     anotarFallo(clave);
     return bloqueado(clave) ? MSG_DERIVAR : MSG_NO_ENCONTRADO;
@@ -169,20 +154,19 @@ async function responderConDni(usuario, numero, candidatos) {
  */
 async function procesar({ usuario, numero, texto }) {
   try {
-    const digitos = extraerDigitos(texto);
+    const hayNumeros = extraerDigitos(texto).length > 0;
     const consulta = esConsultaDeuda(texto);
     const esperando = await esperandoDni(usuario.id, numero);
 
     if (!consulta && !esperando) return null;
 
     // Ya mandó (o está mandando) el DNI.
-    if (digitos.length > 0 && (esperando || consulta)) {
-      // Se busca el DNI DENTRO del mensaje (puede venir con texto u otros números).
-      // Si no hay ningún número que pueda ser un DNI (ej. solo un monto o una edad),
-      // se pide de nuevo en vez de buscar basura.
-      const candidatos = extraerCandidatosDni(texto);
-      if (candidatos.length === 0) return esperando ? MSG_DNI_INVALIDO : MSG_PEDIR_DNI;
-      return await responderConDni(usuario, numero, candidatos);
+    if (hayNumeros && (esperando || consulta)) {
+      // Un mensaje con números que no traen un DNI claro (ej. solo un teléfono o un monto)
+      // en plena consulta: se pide de nuevo en vez de buscar basura.
+      const dni = extraerDni(texto);
+      if (!dni) return esperando ? MSG_DNI_INVALIDO : MSG_PEDIR_DNI;
+      return await responderConDni(usuario, numero, dni);
     }
 
     // Pregunta por su saldo y todavía no dio el DNI.
@@ -201,7 +185,7 @@ module.exports = {
   procesar,
   esConsultaDeuda,
   extraerDigitos,
-  extraerCandidatosDni,
+  extraerDni,
   formatearMonto,
   MSG_PEDIR_DNI,
   MSG_SIN_DATOS,

@@ -152,7 +152,7 @@ async function telefonosGlobales() {
   for (let desde = 0; ; desde += TAMANO_PAGINA) {
     const { data, error } = await supabase
       .from("clientes")
-      .select("id, numero, user_id, monto, alta, dni")
+      .select("id, numero, user_id, monto, alta, dni, apellido")
       .order("id", { ascending: true })
       .range(desde, desde + TAMANO_PAGINA - 1);
     if (error) throw traducir(error);
@@ -226,8 +226,7 @@ async function eliminar(userId, id) {
 // Cobrar (si tienen monto) y NO en Invitar. Por cada fila:
 //   - Teléfono NUEVO                      -> se crea el cliente, con alta.
 //   - Teléfono ya en la agenda del usuario -> se ACTUALIZA el monto a cobrar y, si todavía
-//                                            no tenía alta, se le da. Si no tenía DNI y el
-//                                            Excel lo trae, se completa (el resto no se toca).
+//                                            no tenía alta, se le da (el resto no se toca).
 //   - Teléfono agendado por OTRO usuario   -> no se carga ni se toca; se informa de quién es.
 //   - DNI ya cargado (con otro teléfono) o teléfono repetido dentro del mismo archivo
 //                                          -> no se carga; queda en `errores` con su fila.
@@ -239,7 +238,7 @@ async function importarFilas(userId, filas) {
   const telefonos = await telefonosGlobales(); // todos los usuarios
   const usuarios = await mapaUsuarios();
   const propios = await listar(userId);
-  const dnis = new Set(propios.map((c) => c.dni).filter(Boolean));
+  const dnis = new Map(propios.filter((c) => c.dni).map((c) => [limpiarDni(c.dni), c.id])); // dni -> id
 
   const ahora = new Date().toISOString();
   const errores = [];
@@ -270,30 +269,38 @@ async function importarFilas(userId, filas) {
         }
         // Ya está en la agenda de este usuario: se actualiza el monto y se le da el alta
         // si no la tenía (si ya la tenía, no se toca su fecha de alta).
-        // Si el cliente todavía no tenía DNI y el Excel lo trae, se lo completa: sin DNI
-        // el bot no puede encontrarlo. Nunca se pisa un DNI ya cargado, ni se repite uno
-        // que ya es de otro cliente de esta agenda.
-        let dniNuevo = null;
-        if (datos.dni && !existente.dni && !dnis.has(datos.dni)) {
-          dniNuevo = datos.dni;
-          dnis.add(dniNuevo);
-        }
         const mismoMonto = Number(existente.monto) === datos.monto;
-        if (mismoMonto && existente.alta && !dniNuevo) sinCambios++;
+
+        // DNI: si el cliente ya estaba agendado SIN DNI (o con otro), el del Excel se guarda.
+        // Antes se ignoraba y el bot nunca lo encontraba. Si ese DNI ya lo tiene OTRO cliente
+        // del usuario, no se pisa: queda en `errores`.
+        let nuevoDni;
+        if (datos.dni && limpiarDni(existente.dni) !== datos.dni) {
+          const duenoDni = dnis.get(datos.dni);
+          if (duenoDni !== undefined && duenoDni !== existente.id) {
+            throw httpError(409, "DNI ya cargado en otro cliente.");
+          }
+          nuevoDni = datos.dni;
+          dnis.set(datos.dni, existente.id);
+        }
+        const nuevoApellido = !existente.apellido && datos.apellido ? datos.apellido : undefined;
+
+        if (mismoMonto && existente.alta && !nuevoDni && !nuevoApellido) sinCambios++;
         else {
           aActualizar.push({
             fila: nroFila,
             id: existente.id,
             monto: datos.monto,
             darAlta: !existente.alta,
-            dni: dniNuevo,
+            dni: nuevoDni,
+            apellido: nuevoApellido,
           });
         }
         continue;
       }
 
       if (datos.dni && dnis.has(datos.dni)) throw httpError(409, "DNI repetido (ya está cargado).");
-      if (datos.dni) dnis.add(datos.dni);
+      if (datos.dni) dnis.set(datos.dni, "nuevo");
       nuevas.push({
         fila: nroFila,
         datos: { ...datos, user_id: userId, alta: true, fecha_alta: ahora },
@@ -333,6 +340,7 @@ async function importarFilas(userId, filas) {
             updated_at: ahora,
             ...(u.darAlta ? { alta: true, fecha_alta: ahora } : {}),
             ...(u.dni ? { dni: u.dni } : {}),
+            ...(u.apellido ? { apellido: u.apellido } : {}),
           })
           .eq("id", u.id)
           .eq("user_id", userId); // solo se toca lo propio
@@ -362,27 +370,52 @@ async function marcarInvitado(userId, numero) {
   return data?.length || 0;
 }
 
+// Filas de `clientes` con ese DNI (solo dígitos). `userId` limita a la agenda de un usuario;
+// sin `userId` busca en la de todos.
+async function filasPorDni(d, userId) {
+  // 1) Coincidencia exacta: lo normal, porque el DNI se guarda solo con dígitos.
+  let q = supabase.from("clientes").select("*").eq("dni", d).limit(5);
+  if (userId) q = q.eq("user_id", userId);
+  const exacto = await q;
+  if (exacto.error) throw traducir(exacto.error);
+  if (exacto.data?.length) return exacto.data;
+
+  // 2) Respaldo: DNI guardado con formato ("27.345.678", "27345678 ", "DNI 27345678"...),
+  //    por ejemplo cargado a mano en Supabase. Se traen los parecidos y se comparan solo dígitos.
+  try {
+    let q2 = supabase.from("clientes").select("*").ilike("dni", "%" + d.split("").join("%") + "%").limit(50);
+    if (userId) q2 = q2.eq("user_id", userId);
+    const flexible = await q2;
+    if (flexible.error) throw flexible.error;
+    return (flexible.data || []).filter((r) => limpiarDni(r.dni) === d);
+  } catch (e) {
+    console.warn("[Clientes] Búsqueda flexible de DNI no disponible:", e.message);
+    return [];
+  }
+}
+
 // Busca un cliente por DNI (comparando solo dígitos). Devuelve null si no existe.
 // Un usuario busca en SU agenda; el administrador, si no lo encuentra en la suya,
 // busca en la de todos (los clientes que escriben por su cuenta le llegan a él).
-async function buscarPorDni(usuario, dni) {
+// `numero` (opcional) es el WhatsApp de quien escribe: si el DNI está en la agenda de OTRO
+// usuario pero ese cliente tiene justo este teléfono, es la misma persona y se lo encuentra
+// igual (en el número compartido la conversación puede caer en un usuario distinto al que
+// cargó al cliente). No se expone ningún cliente que no sea el que escribe.
+async function buscarPorDni(usuario, dni, numero = null) {
   const d = limpiarDni(dni);
   if (!dniValido(d)) return null;
 
-  const propio = await supabase
-    .from("clientes")
-    .select("*")
-    .eq("user_id", usuario.id)
-    .eq("dni", d)
-    .maybeSingle();
-  if (propio.error) throw traducir(propio.error);
-  if (propio.data) return aApi(propio.data);
+  const propios = await filasPorDni(d, usuario.id);
+  if (propios[0]) return aApi(propios[0]);
 
-  if (usuario.role !== "admin") return null;
+  const k = limpiarNumero(numero).slice(-10);
+  const esAdmin = usuario.role === "admin";
+  if (!esAdmin && k.length < 8) return null;
 
-  const global = await supabase.from("clientes").select("*").eq("dni", d).limit(1);
-  if (global.error) throw traducir(global.error);
-  return global.data?.[0] ? aApi(global.data[0]) : null;
+  const todos = await filasPorDni(d, null);
+  const mismoTelefono = todos.find((r) => k.length >= 8 && limpiarNumero(r.numero).slice(-10) === k);
+  if (mismoTelefono) return aApi(mismoTelefono);
+  return esAdmin && todos[0] ? aApi(todos[0]) : null;
 }
 
 // Busca al cliente que escribe por su número de WhatsApp (compara los últimos 10 dígitos:
