@@ -649,6 +649,7 @@ async function procesarMensajeEntrante(msg, contactName, usuario, compartido = f
         // reconoció, avisa con una marca y el servidor pide el DNI.
         if (respuestaIA && respuestaIA.includes("[[PEDIR_DNI]]")) {
           respuestaIA = botDeuda.MSG_PEDIR_DNI;
+          botDeuda.marcarEspera(numeroLimpio); // la próxima respuesta del cliente es su DNI
         }
       }
 

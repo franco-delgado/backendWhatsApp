@@ -351,63 +351,63 @@ async function marcarInvitado(userId, numero) {
   return data?.length || 0;
 }
 
+// "27345678" -> "%2%7%3%4%5%6%7%8%": coincide con "27.345.678", " 27345678", "27 345 678"...
+// Sirve para encontrar DNI que quedaron guardados con puntos o espacios (cargas manuales
+// o anteriores a la limpieza). Después se confirma en JS que los dígitos sean EXACTAMENTE los mismos.
+const patronTolerante = (d) => "%" + d.split("").join("%") + "%";
+
+// Filas de `clientes` cuyo DNI (solo dígitos) es `d`. `userId` = null busca en todas las agendas.
+//   1) Coincidencia exacta (rápida, usa el índice).
+//   2) Si no hay, coincidencia tolerante a puntos/espacios guardados en la base.
+async function filasPorDni(d, userId = null) {
+  let q = supabase.from("clientes").select("*").eq("dni", d).limit(10);
+  if (userId) q = q.eq("user_id", userId);
+  const exacta = await q;
+  if (exacta.error) throw traducir(exacta.error);
+  if (exacta.data?.length) return exacta.data;
+
+  let t = supabase.from("clientes").select("*").ilike("dni", patronTolerante(d)).limit(50);
+  if (userId) t = t.eq("user_id", userId);
+  const tolerante = await t;
+  // Si la columna no es de texto, el ilike falla: no es un error del cliente, simplemente no hay más que probar.
+  if (tolerante.error) {
+    console.warn("[Clientes] Búsqueda tolerante de DNI no disponible:", tolerante.error.message);
+    return [];
+  }
+  return (tolerante.data || []).filter((r) => limpiarDni(r.dni) === d);
+}
+
 // Busca un cliente por DNI (comparando solo dígitos). Devuelve null si no existe.
 // Un usuario busca en SU agenda; el administrador, si no lo encuentra en la suya,
 // busca en la de todos (los clientes que escriben por su cuenta le llegan a él).
-async function buscarPorDni(usuario, dni) {
+// `numero` (opcional) = teléfono de WhatsApp de quien escribe: si el mismo DNI está en varias
+// agendas, se prefiere al cliente cuyo teléfono coincide.
+async function buscarPorDni(usuario, dni, numero = null) {
   const d = limpiarDni(dni);
   if (!dniValido(d)) return null;
 
-  const propio = await supabase
-    .from("clientes")
-    .select("*")
-    .eq("user_id", usuario.id)
-    .eq("dni", d)
-    .maybeSingle();
-  if (propio.error) throw traducir(propio.error);
-  if (propio.data) return aApi(propio.data);
+  const propias = await filasPorDni(d, usuario.id);
+  if (propias[0]) return aApi(propias[0]);
 
   if (usuario.role !== "admin") return null;
 
-  const global = await supabase.from("clientes").select("*").eq("dni", d).limit(1);
-  if (global.error) throw traducir(global.error);
-  return global.data?.[0] ? aApi(global.data[0]) : null;
+  const todas = await filasPorDni(d, null);
+  if (!todas.length) return null;
+  const k = limpiarNumero(numero).slice(-10);
+  const elegida = (k && todas.find((r) => String(r.numero).endsWith(k))) || todas[0];
+  return aApi(elegida);
 }
 
-// ---------------------------------------------------------------------------
-// Búsqueda por NOMBRE (para la consulta de saldo del bot)
-// ---------------------------------------------------------------------------
-
-// Minúsculas, sin tildes ni signos: "María  Núñez!" -> "maria nunez".
-const normalizarTexto = (t) =>
-  String(t ?? "")
-    .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-// ¿El cliente coincide con las palabras que escribió la persona (ya normalizadas)?
-//  - Cada palabra escrita debe ser una palabra COMPLETA del nombre o apellido del cliente
-//    (no vale "mar" para "María"), en cualquier orden: "perez juan" encuentra a "Juan Pérez".
-//  - Se exigen al menos 2 palabras (nombre y apellido). Única excepción: un cliente
-//    cargado con una sola palabra de nombre y sin apellido (p. ej. "Luis" desde el Excel).
-function coincideNombre(cliente, palabras) {
-  const propias = normalizarTexto(`${cliente.nombre} ${cliente.apellido || ""}`)
-    .split(" ")
-    .filter(Boolean);
-  if (palabras.length < 2 && propias.length > 1) return false;
-  return palabras.length > 0 && palabras.every((p) => propias.includes(p));
-}
-
-// Busca clientes por nombre y apellido. Devuelve TODOS los que coinciden (puede haber
-// homónimos; quien llama decide qué hacer si son varios). Un usuario busca en SU agenda;
-// el administrador, si no encuentra en la suya, busca en la de todos (igual que el DNI).
-async function buscarPorNombre(usuario, palabras) {
-  const propios = (await listar(usuario.id)).filter((c) => coincideNombre(c, palabras));
-  if (propios.length || usuario.role !== "admin") return propios;
-  return (await listar("todos")).filter((c) => coincideNombre(c, palabras));
+// Solo para diagnóstico en el log del servidor: ¿ese DNI existe en la agenda de OTRO usuario?
+// (No se usa para responderle al cliente: cada usuario solo ve su propia agenda.)
+async function existeEnOtraAgenda(usuario, dni) {
+  try {
+    const d = limpiarDni(dni);
+    const filas = await filasPorDni(d, null);
+    return filas.some((r) => r.user_id !== usuario.id);
+  } catch (e) {
+    return false;
+  }
 }
 
 // Busca al cliente que escribe por su número de WhatsApp (compara los últimos 10 dígitos:
@@ -452,8 +452,6 @@ module.exports = {
   importarFilas,
   marcarInvitado,
   buscarPorDni,
-  buscarPorNombre,
-  coincideNombre,
-  normalizarTexto,
+  existeEnOtraAgenda,
   buscarPorTelefono,
 };
