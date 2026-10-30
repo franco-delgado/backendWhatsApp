@@ -646,10 +646,17 @@ async function procesarMensajeEntrante(msg, contactName, usuario, compartido = f
         respuestaIA = await responderConIA(textoParaIA, historial, cliente);
 
         // Red de seguridad: si la IA detectó una consulta de saldo que el filtro no
-        // reconoció, avisa con una marca y el servidor pide el DNI.
+        // reconoció, avisa con una marca y el servidor la resuelve igual: mira el número
+        // desde el que escribe y, si no está en la base, pide el DNI. (El pedido de DNI queda
+        // guardado como mensaje del bot, y de ahí se sabe que el próximo mensaje es el DNI.)
         if (respuestaIA && respuestaIA.includes("[[PEDIR_DNI]]")) {
-          respuestaIA = botDeuda.MSG_PEDIR_DNI;
-          botDeuda.marcarEspera(numeroLimpio); // la próxima respuesta del cliente es su DNI
+          respuestaIA =
+            (await botDeuda.procesar({
+              usuario,
+              numero: numeroLimpio,
+              texto: textoParaIA,
+              forzarConsulta: true,
+            })) || botDeuda.MSG_PEDIR_DNI;
         }
       }
 
